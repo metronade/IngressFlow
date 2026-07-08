@@ -8,3 +8,5 @@ redis==5.2.1
 celery==5.4.0
 cryptography==44.0.0
 stream-zip==0.0.84
+fastapi-users[sqlalchemy]==15.0.5
+stripe==15.3.0
