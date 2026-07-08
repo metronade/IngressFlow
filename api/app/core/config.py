@@ -6,6 +6,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://ingressflow:ingressflow@postgres:5432/ingressflow"
     redis_url: str = "redis://redis:6379/0"
+    secret_key: str = "dev-insecure-secret-change-me"  # JWT signing + reset/verify tokens
+    stripe_secret_key: str | None = None
+    stripe_webhook_secret: str | None = None
+    stripe_price_id: str | None = None  # the recurring "paid tier" Price to check out
+    public_web_url: str = "http://localhost:3000"  # for Stripe Checkout success/cancel redirects
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
