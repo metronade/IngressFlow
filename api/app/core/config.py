@@ -11,6 +11,9 @@ class Settings(BaseSettings):
     stripe_webhook_secret: str | None = None
     stripe_price_id: str | None = None  # the recurring "paid tier" Price to check out
     public_web_url: str = "http://localhost:3000"  # for Stripe Checkout success/cancel redirects
+    admin_bootstrap_email: str | None = None  # one-time: this email becomes admin on registration
+    media_root: str = "/data/scrapes"  # for admin disk-usage reporting (shared.storage.MEDIA_ROOT)
+    proxy_stats_url: str = "http://proxy:8888/stats"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

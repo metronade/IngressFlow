@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import get_settings
 from app.db.session import get_db
 from shared.models import User
+from shared.models.enums import UserRole
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,16 @@ class UserManager(UUIDIDMixin, BaseUserManager[User, uuid.UUID]):
 
     async def on_after_register(self, user: User, request: Request | None = None) -> None:
         logger.info("user registered: %s", user.email)
+
+        # Bootstrap the first admin account from config — there's no admin UI
+        # yet to promote someone, and promoting-via-admin-panel is a
+        # chicken-and-egg problem for whoever gets there first (PLAN.md §9
+        # Phase 5). Matching this email on registration is the one-time seed;
+        # anyone promoted after that goes through the admin panel itself.
+        bootstrap_email = get_settings().admin_bootstrap_email
+        if bootstrap_email and user.email.lower() == bootstrap_email.lower():
+            await self.user_db.update(user, {"is_superuser": True, "role": UserRole.ADMIN})
+            logger.warning("bootstrapped %s as admin via ADMIN_BOOTSTRAP_EMAIL", user.email)
 
     async def on_after_forgot_password(
         self, user: User, token: str, request: Request | None = None
@@ -71,3 +82,4 @@ fastapi_users = FastAPIUsers[User, uuid.UUID](get_user_manager, [auth_backend])
 
 current_active_user = fastapi_users.current_user(active=True)
 current_active_user_optional = fastapi_users.current_user(active=True, optional=True)
+current_superuser = fastapi_users.current_user(active=True, superuser=True)
