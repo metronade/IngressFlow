@@ -64,6 +64,9 @@ class ScrapeItem(Base, UUIDPk):
     category_id: Mapped[uuid.UUID] = mapped_column(
         PGUUID(as_uuid=True), ForeignKey("categories.id"), index=True
     )
+    # UUID primary keys don't sort in submission order — run_batch needs a
+    # stable, gapless order to process the chain exactly as pasted.
+    sequence: Mapped[int] = mapped_column(Integer, index=True)
     url: Mapped[str] = mapped_column(Text)
     platform: Mapped[str | None] = mapped_column(String(50), nullable=True)
     status: Mapped[ScrapeItemStatus] = mapped_column(
