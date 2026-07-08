@@ -4,13 +4,25 @@ services:
       context: ./web
       args:
         # Browser-side (NEXT_PUBLIC_*) vars are baked in at build time, not
-        # read at container start. Dev only: without NPM in front, the
-        # browser can't reach api:8000 by its Docker-internal name, so it
-        # needs the published host port explicitly. Omit both in a prod
-        # build — lib/api.ts and lib/ws.ts fall back to same-origin, which
-        # is correct once NPM fronts everything on one domain (PLAN.md §4.4).
-        NEXT_PUBLIC_API_BASE: "http://localhost:8000"
-        NEXT_PUBLIC_WS_BASE: "ws://localhost:8000"
+        # read at container start — the browser, not this container, needs
+        # to be able to resolve them. Pulled from .env (NEXT_PUBLIC_API_BASE/
+        # NEXT_PUBLIC_WS_BASE) so this is correct for more than just laptop
+        # localhost dev:
+        #   - pure local dev (no NPM): leave the http://localhost:8000 /
+        #     ws://localhost:8000 defaults below.
+        #   - a VM/server reachable at an IP or domain, still without NPM in
+        #     front (ports published directly): set both to that host, e.g.
+        #     NEXT_PUBLIC_API_BASE=http://203.0.113.10:8000 in .env.
+        #   - NPM fronting everything on one domain (the intended prod setup,
+        #     §2/§4.4): set both to "" (empty) in .env — lib/api.ts and
+        #     lib/ws.ts fall back to same-origin, which is what you want.
+        # Whichever case applies, `docker compose build web` must be re-run
+        # after changing .env — these are baked in, not read at runtime.
+        # Single-dash form on purpose: unset -> the localhost default; set to
+        # "" explicitly -> stays empty (the same-origin/NPM case). The more
+        # common ":-" form can't tell "unset" from "set to empty" apart.
+        NEXT_PUBLIC_API_BASE: "${NEXT_PUBLIC_API_BASE-http://localhost:8000}"
+        NEXT_PUBLIC_WS_BASE: "${NEXT_PUBLIC_WS_BASE-ws://localhost:8000}"
     env_file: .env
     environment:
       - INTERNAL_API_URL=http://api:8000
