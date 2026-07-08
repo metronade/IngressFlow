@@ -24,9 +24,11 @@ Distilling the brief into hard requirements and the constraints that drive the a
 | Area | Requirement |
 |---|---|
 | Input | Paste textarea; category headers (`L1234`) group the URLs beneath them until a blank line / next header. |
-| Platforms | TikTok, Instagram, YouTube, X.com, Reddit, Snapchat, Facebook, Vimeo. Highest quality. Dedup per link. |
+| Platforms | TikTok, Instagram, YouTube, X.com, Reddit, Snapchat, Facebook, Vimeo. Highest quality. Dedup per link. **Official API first, scraping only as fallback** ([§4.3](#43-scraping-core--api-first-extractor-strategy)). |
 | Config | Toggles: Video-only, Image-only, Include metadata JSON. |
-| Anti-blocking | Randomized 1.8–4.2s delays, UA rotation, optional residential proxy (per-GB billed), optional admin cookie injection. |
+| Lawful-use gate | Mandatory attestation checkbox per scrape ("I hold the rights/lawful basis") — **submit is rejected without it**; the acceptance is recorded and transfers responsibility to the operator ([§4.7](#47-audit--lawful-use-attestation)). |
+| Audit | Append-only log of who started which scrape (actor/IP, URLs, config, attestation, extractor tier) — outlives the 6h media window ([§4.7](#47-audit--lawful-use-attestation)). |
+| Anti-blocking | Randomized 1.8–4.2s delays, UA rotation, optional residential proxy (per-GB billed), optional admin OAuth/cookie injection. Applied on the **Tier-2 scrape-fallback path only**. |
 | Live dashboard | WebSocket stats: progress `X/Y`, image/video counts, live total data size; per-URL status (green/yellow/red), per-URL `X/X images \| Y/Y videos`, copy-link button. Browser notification on batch completion. |
 | Storage | 6-hour disk cache; per-scrape unauthenticated share link; hard-delete + link invalidation at exactly 6h. |
 | Export | Single ZIP; folders named by category; gallery with ALL / by-category / by-link scopes, multi-select download, filtered-view ZIP, previews + native video. |
@@ -51,7 +53,7 @@ The proposed stack is sound. My changes are additive and low-risk; each is justi
 | Backend | FastAPI | **Keep.** Add **Pydantic v2** schemas, **Alembic** migrations. | FastAPI's async model suits the WS + I/O-bound scraping orchestration. |
 | Queue | Celery **or** RQ + Redis | **Celery** (decided). | Celery's `revoke`, per-task time limits, custom routing, and mature monitoring (Flower) matter for cancellable long-running batches. RQ is simpler but weaker on cancellation/observability. |
 | Task shape | (unspecified) | **One task per batch, iterating internally** — *not* a 100-task chain. | Keeps browser/proxy/cookie session affinity for the whole batch, makes pacing/human-mimicry trivial, simplifies cancellation and progress. See [§4.2](#42-the-worker-queue-the-core-design). |
-| Scraping | yt-dlp + Playwright | **Add `gallery-dl`.** | yt-dlp is best-in-class for *video*; `gallery-dl` is purpose-built for *image galleries* (Instagram, Reddit, X). Playwright is the fallback for JS-walled/edge cases and cookie-based auth. Three-tier extractor strategy in [§4.3](#43-scraping-core-extractor-strategy). |
+| Media acquisition | yt-dlp + Playwright | **API-first, scrape-fallback.** Official platform APIs (Tier 1) → yt-dlp / **gallery-dl** / Playwright (Tier 2). | The lawful path ([§10](#10-legal--compliance-risk)) requires trying ToS-compliant official APIs first; scraping (with residential proxy / OAuth-cookie auth) is the fallback only where no API is usable. `gallery-dl` added for image galleries. Full tiering in [§4.3](#43-scraping-core--api-first-extractor-strategy). |
 | DB | PostgreSQL + SQLAlchemy | **Keep.** SQLAlchemy 2.0 async + Alembic. | — |
 | Cache/broker | Redis | **Keep — and use it for 3 jobs**: Celery broker/result backend, **Pub/Sub for WebSocket fan-out**, and rate-limit counters. | Pub/Sub decouples workers from the web layer (workers publish progress; the FastAPI WS process subscribes and forwards). Critical for the realtime design. |
 | Object storage | local disk | **Local volume now, behind a storage interface** so **MinIO/S3** can swap in later. | 6h retention + ZIP assembly + disk-full predictor all assume local disk today; the interface avoids a rewrite when scaling past one host. |
@@ -171,14 +173,24 @@ def run_batch(self, scrape_id: str):
 
 **Queue routing:** a single `scrapes` queue is sufficient — the `concurrency=10` cap *is* the "10 users" limit. (If per-tenant fairness becomes an issue, upgrade to per-user rate limits or a fair-scheduling broker later; not needed for v1.)
 
-### 4.3 Scraping core (extractor strategy)
+### 4.3 Scraping core — **API-first extractor strategy**
 
-Three-tier cascade per URL, first success wins; dedup by resolved media URL/hash:
-1. **yt-dlp** — primary for video (YouTube, TikTok, Vimeo, X, Facebook, Reddit video). Highest-quality format selection (`bestvideo+bestaudio/best`).
-2. **gallery-dl** — primary for image sets/carousels (Instagram, Reddit galleries, X media, Snapchat spotlight).
-3. **Playwright** — fallback for JS-walled or login-gated content; also the vehicle for **admin cookie injection** (Instagram/X session cookies) and for capturing dynamically-rendered media.
+The lawful path ([§10](#10-legal--compliance-risk)) drives the extractor order: **official APIs first, scraping only as fallback where no usable API exists.** Per URL we resolve the platform, then walk tiers top-down; **first success wins**; dedup by resolved media URL/content hash.
 
-Config toggles (`video_only`, `image_only`, `include_metadata`) filter what each extractor keeps. Metadata JSON is written alongside media when enabled.
+**Tier 1 — Official platform API (preferred, ToS-compliant).** The only route that doesn't breach platform terms. Attempted first whenever credentials are configured and the API can serve the asset:
+- **YouTube Data API**, **Vimeo API**, **Meta Graph API** (Instagram/Facebook), **TikTok Research/Display API**, **X API**, **Reddit API**.
+- APIs are rate-limited and coverage is partial (some content/media isn't retrievable, some platforms — e.g. Snapchat — have no suitable public API). Missing/failed API access falls through to Tier 2.
+- API credentials are admin-configured per platform and stored encrypted (same handling as cookies, [§10](#10-legal--compliance-risk)).
+
+**Tier 2 — Fallback scraping (used only when no API is provided/usable for that platform).** This is where legal risk concentrates and where **residential proxy + OAuth/cookie auth** apply:
+- **yt-dlp** — video (YouTube, TikTok, Vimeo, X, Facebook, Reddit video); highest-quality format (`bestvideo+bestaudio/best`).
+- **gallery-dl** — image sets/carousels (Instagram, Reddit galleries, X media, Snapchat spotlight).
+- **Playwright** — JS-walled / login-gated content; also the vehicle for **admin OAuth/cookie injection** (Instagram/X session) and dynamically-rendered media.
+- Residential proxy and cookie/OAuth auth are **admin-gated, off by default**, and only ever engaged on the Tier-2 path.
+
+Each extractor records **which tier/method served the item** (`MediaFile.source_method` = `api` \| `ytdlp` \| `gallerydl` \| `playwright`) so the audit log ([§4.7](#47-audit--lawful-use-attestation)) and per-platform health view can show the API-vs-scrape mix and where fallback is being hit.
+
+Config toggles (`video_only`, `image_only`, `include_metadata`) filter what each tier keeps. Metadata JSON is written alongside media when enabled.
 
 ### 4.4 Realtime pipeline (WebSockets)
 
@@ -201,6 +213,16 @@ Hourly Beat task. Model net disk velocity accounting for the 6h deletion cycle:
 - `net_rate = bytes_in − bytes_out`. If `net_rate ≤ 0`: **stable, no forecast**. If `> 0`: `hours_to_full = free_bytes / net_rate`, surfaced with a confidence band and a threshold alert (e.g. warn at <24h).
 - Store hourly samples in a `disk_samples` table so the admin chart shows the trend, not just a number.
 
+### 4.7 Audit & lawful-use attestation
+
+The operator — not the tool — carries the rights ([§10](#10-legal--compliance-risk)). Two mechanisms make that concrete and defensible:
+
+**Lawful-use attestation (gate before scrape).** Every scrape submission requires a checked **"I confirm I have the rights/lawful basis to ingest this content for editorial use"** box. The submit endpoint **rejects the batch if it is not checked** — the attestation is not decorative. We persist the exact attestation text/version, who accepted it, when, and from which IP, bound to the scrape. This is what transfers responsibility to the operator.
+
+**Audit log (who scraped what, when).** An append-only `AuditLog` records every scrape start (and other sensitive actions: credential/cookie changes, proxy toggles, share-link access, takedowns). For each scrape start we store: actor (user id or anonymous+IP), timestamp, the submitted URLs/categories, config, the attestation record id, and the extractor tiers used. Append-only (no update/delete via app), retained beyond the 6h media window for accountability, exportable for a takedown/DSAR response.
+
+Together these answer "who started which scrape, under what asserted rights" — the two questions a broadcaster's legal team and any complainant will ask.
+
 ---
 
 ## 5. Data Model (core entities)
@@ -210,20 +232,29 @@ User            id, email, hashed_pw, role[public|free|paid|admin], stripe_custo
                 credit_balance, created_at
 Scrape          id, user_id (nullable for public), status, config(jsonb: video_only/…),
                 share_token, total_images, total_videos, total_bytes,
-                created_at, expires_at, proxy_used, ua_used
+                created_at, expires_at, proxy_used, ua_used, attestation_id
 Category        id, scrape_id, name (e.g. "L1234"), order
-ScrapeItem      id, scrape_id, category_id, url, status, images_found, images_ok,
+ScrapeItem      id, scrape_id, category_id, url, platform, status, images_found, images_ok,
                 videos_found, videos_ok, error, started_at, finished_at
 MediaFile       id, item_id, category_id, type[image|video], path, bytes, width, height,
-                duration, source_url, checksum (dedup), metadata_json
+                duration, source_url, source_method[api|ytdlp|gallerydl|playwright],
+                checksum (dedup), metadata_json
 UsageEvent      id, user_id, ip, scrape_id, links_count, bytes, proxy_gb, created_at   (billing/limits)
 Setting         key, value        (max_links, max_scrapes_per_ip_24h, retention_hours, proxy_enabled…)
 CmsPage         slug[impressum|tos|privacy], content_md, updated_at, updated_by
-AdminCookie     platform[instagram|x|…], cookie_blob(encrypted), added_by, valid_until
+PlatformCredential  platform, kind[api_key|oauth_token|cookie], secret_blob(encrypted),
+                added_by, valid_until, enabled          # Tier-1 API keys AND Tier-2 cookies/OAuth
+LawfulAttestation   id, scrape_id, text_version, accepted (bool), actor_user_id (nullable),
+                actor_ip, accepted_at                    # the transferred-rights record (§4.7)
+AuditLog        id, ts, actor_user_id (nullable), actor_ip, action, target_type, target_id,
+                detail(jsonb)                             # append-only; who did what, when (§4.7)
 DiskSample      id, ts, free_bytes, bytes_in_rate, bytes_out_rate, hours_to_full
 ```
 
-Note: `AdminCookie.cookie_blob` **encrypted at rest** (see [§10](#10-legal--compliance-risk)). Never exposed to non-admin users or in API responses.
+Notes:
+- `PlatformCredential.secret_blob` (Tier-1 API keys, Tier-2 OAuth tokens/cookies) is **encrypted at rest** ([§10](#10-legal--compliance-risk)); never exposed to non-admin users or in API responses. This replaces the earlier `AdminCookie` table and covers both API and scrape-fallback credentials.
+- `LawfulAttestation` is required for every `Scrape`; a batch with `accepted = false`/absent is rejected at submit ([§4.7](#47-audit--lawful-use-attestation)).
+- `AuditLog` is **append-only** (no app-level update/delete) and outlives the 6h media window.
 
 ---
 
@@ -249,11 +280,11 @@ IngressFlow/
 │   ├── Dockerfile
 │   ├── app/
 │   │   ├── main.py
-│   │   ├── api/routes/          # scrapes, auth, gallery, admin, billing, cms, share
+│   │   ├── api/routes/          # scrapes, auth, gallery, admin, billing, cms, share, audit, takedown
 │   │   ├── ws/                  # connection hub + Redis Pub/Sub subscriber
 │   │   ├── models/              # SQLAlchemy
 │   │   ├── schemas/             # Pydantic v2
-│   │   ├── services/            # parsing, limits, storage iface, billing
+│   │   ├── services/            # parsing, limits, storage iface, billing, audit, attestation
 │   │   ├── core/                # config, security, deps
 │   │   └── db/                  # session, alembic env
 │   └── alembic/
@@ -265,7 +296,8 @@ IngressFlow/
 │   │   ├── retention.py         # 6h sweep (§4.5)
 │   │   └── predictor.py         # disk forecast (§4.6)
 │   └── scraping/
-│       ├── extractors/          # ytdlp.py, gallerydl.py, playwright.py
+│       ├── extractors/          # api/ (per-platform Tier-1), ytdlp.py, gallerydl.py, playwright.py
+│       ├── resolver.py          # url → platform; picks Tier-1 API vs Tier-2 fallback
 │       ├── session.py           # UA rotation, proxy, cookie injection
 │       └── parser.py            # category-header text parsing
 ├── shared/                      # models/schemas shared by api + worker (single source of truth)
@@ -341,8 +373,8 @@ Suggestions the brief invited — take or leave per phase:
 2. **Resume/retry failed items** — re-run only the red/yellow URLs of a finished scrape without re-scraping the successes. Falls out naturally from per-item checkpointing.
 3. **`gallery-dl` addition** (see [§2](#2-stack-review--proposed-vs-recommended)) — materially better image coverage than Playwright-only.
 4. **Duplicate detection by checksum**, not just by source URL — the brief says "avoid duplicates per link"; content-hash dedup also catches the same asset reposted across links within a batch.
-5. **Takedown / DMCA endpoint** and an audit log — a public broadcaster will need a documented process (see [§10](#10-legal--compliance-risk)).
-6. **Per-platform health indicator** in admin — extractors break when platforms change; surface success rates per platform so ops sees breakage early.
+5. **API-first acquisition + lawful-use attestation + audit log** — now core, not optional (see [§4.3](#43-scraping-core--api-first-extractor-strategy) and [§4.7](#47-audit--lawful-use-attestation)). Plus a **takedown/DMCA endpoint** that writes to the same audit trail.
+6. **Per-platform health indicator** in admin — extractors break when platforms change; surface success rates *and the API-vs-fallback ratio* per platform so ops sees breakage (and silent fallback to the riskier scrape path) early.
 7. **Storage interface from day one** — trivial now, saves a painful migration later.
 
 ---
@@ -357,17 +389,18 @@ Each phase ends with something demonstrable. Rough sizing assumes a small team; 
 - Health checks + a "hello" round trip: web → api → db → redis.
 - **Exit:** `docker compose up` yields a reachable frontend and a green `/api/health`.
 
-### Phase 1 — Scraping engine (headless, no UI polish)
-- Category-header **text parser** (`L1234` grouping).
+### Phase 1 — Acquisition engine (headless, no UI polish)
+- Category-header **text parser** (`L1234` grouping); URL → platform **resolver**.
 - `run_batch` task ([§4.2](#42-the-worker-queue-the-core-design)): sequential loop, jitter delays, UA rotation, per-item checkpointing, cancellation, resume-on-crash.
-- Extractor cascade: yt-dlp → gallery-dl → Playwright ([§4.3](#43-scraping-core-extractor-strategy)); config toggles; media written to `/data/scrapes/...`.
-- **Exit:** submit a batch via API, watch 10 concurrent batches run sequentially, media on disk, correct ZIP-ready layout.
+- **API-first tiering** ([§4.3](#43-scraping-core--api-first-extractor-strategy)): Tier-1 official APIs where credentials exist → Tier-2 yt-dlp / gallery-dl / Playwright fallback; record `source_method` per item; config toggles; media written to `/data/scrapes/...`.
+- **Attestation gate + audit log** ([§4.7](#47-audit--lawful-use-attestation)): submit rejected without accepted attestation; every scrape start written to append-only `AuditLog`. (Build the enforcement here, at the API boundary, so no path can bypass it.)
+- **Exit:** a batch with a valid attestation runs (API-first, scrape-fallback) across 10 concurrent slots; a batch *without* attestation is rejected; audit rows recorded; media on disk in ZIP-ready layout.
 
 ### Phase 2 — Realtime dashboard
 - Redis Pub/Sub → FastAPI WS hub → browser ([§4.4](#44-realtime-pipeline-websockets)).
-- Input UI (textarea + toggles), top-bar stats, per-URL list with status icons + copy-link, queue position.
+- Input UI (textarea + toggles + **mandatory lawful-use checkbox** wired to the Phase-1 gate), top-bar stats, per-URL list with status icons + copy-link, queue position.
 - Web Notification API on completion.
-- **Exit:** paste links, watch live progress + completion notification end to end.
+- **Exit:** paste links, accept attestation, watch live progress + completion notification end to end; submit is blocked if the checkbox is unchecked.
 
 ### Phase 3 — Storage, retention, export, gallery
 - `StorageBackend` interface (local impl); streamed ZIP export (category folders).
@@ -384,12 +417,12 @@ Each phase ends with something demonstrable. Rough sizing assumes a small team; 
 ### Phase 5 — Admin dashboard
 - Live IO/CPU/disk (host metrics); Flower behind admin auth.
 - **Disk-full predictor** ([§4.6](#46-disk-full-predictor-admin)) with trend chart.
-- Settings (limits, retention); CMS for Impressum/ToS/Privacy; **encrypted admin cookie injection** UI; proxy toggle + per-GB usage accounting.
-- Per-platform health indicators.
-- **Exit:** admin can tune limits, edit legal pages, deposit cookies, and read the disk forecast.
+- Settings (limits, retention); CMS for Impressum/ToS/Privacy; **encrypted `PlatformCredential` UI** for Tier-1 API keys *and* Tier-2 OAuth/cookies; proxy toggle + per-GB usage accounting.
+- **Audit log viewer** (search/export who-scraped-what) and **per-platform health** incl. the API-vs-fallback mix (`source_method`).
+- **Exit:** admin can tune limits, edit legal pages, add API keys/cookies, read the disk forecast, and query the audit log.
 
 ### Phase 6 — Hardening & launch
-- Compliance pass ([§10](#10-legal--compliance-risk)): DMCA/takedown endpoint, audit log, GDPR data-handling doc, cookie/secret encryption review.
+- Compliance pass ([§10](#10-legal--compliance-risk)): DMCA/takedown endpoint (writes to audit log), attestation-text/ToS legal sign-off, GDPR data-handling doc, secret-encryption review.
 - Load test the 10-slot model; failure injection (kill a worker mid-batch → verify resume).
 - Prod overlay, TLS, backups, monitoring/alerting, structured logs.
 - **Exit:** production deploy runbook; passes a security + compliance review.
@@ -404,7 +437,7 @@ This must be designed in, not bolted on — the target users are **public broadc
 *Not legal advice — get German media-law counsel before launch.* A defensible path exists and should shape the product:
 
 1. **API-first, scraping as fallback.** Use official platform APIs where they exist (YouTube Data, Meta Graph, TikTok, Vimeo) — the only route that doesn't breach platform ToS. Scraping is the fallback and is where risk concentrates.
-2. **The operator holds the rights, not the tool.** The lawful use case is a broadcaster ingesting content they have a licence to, or that fits a statutory exception, for editorial review. The software *enables* this; it can't *enforce* it. Push lawful-use responsibility onto the operator via ToS.
+2. **The operator holds the rights, not the tool.** The lawful use case is a broadcaster ingesting content they have a licence to, or that fits a statutory exception, for editorial review. The software *enables* this; it can't *enforce* it. This is made concrete by the **mandatory per-scrape lawful-use attestation + append-only audit log** ([§4.7](#47-audit--lawful-use-attestation)): the operator must actively assert rights to submit, and every scrape is attributable.
 3. **Lean on the press privilege.** DE/EU exceptions — §50 UrhG (current-events reporting), §51 (quotation), and crucially the **Medienprivileg / GDPR Art. 85 journalism exemption** — are exactly why this fits *public broadcasters* far better than a general-audience tool. The 6h auto-delete reinforces the "transient editorial ingest, not an archive" position (data minimisation).
 4. **Two legal layers, kept separate:** *copyright/GDPR* (addressed by exceptions + rights ownership) vs. *platform ToS* (contract law — breach is generally civil, not criminal, but still real). Login-wall **cookie bypass** and **residential proxies** raise exposure materially: keep them **admin-only, off by default, and a documented sign-off**, never a user-facing default.
 
@@ -412,7 +445,7 @@ This must be designed in, not bolted on — the target users are **public broadc
 
 
 - **Platform ToS**: automated scraping of TikTok/Instagram/X/etc. generally violates their terms. Cookie injection to bypass login walls increases exposure. This is a product/legal risk the operator must accept and document; the software should make lawful use *possible* (e.g. only content the org has rights to) but cannot enforce it.
-- **Copyright**: scraped media is third-party IP. The 6h retention window helps ("transient ingest for editorial review") but does not confer rights. Provide a **takedown endpoint + audit log** (who scraped what, when, from where).
+- **Copyright**: scraped media is third-party IP. The 6h retention window helps ("transient ingest for editorial review") but does not confer rights. The **mandatory lawful-use attestation** ([§4.7](#47-audit--lawful-use-attestation)) puts the rights assertion on the operator per scrape; the **append-only audit log** + **takedown endpoint** answer "who scraped what, when, from where, under what asserted basis."
 - **GDPR**: scraped media often contains personal data. Document lawful basis, retention (the 6h auto-delete is a strong data-minimization story), and data-subject request handling. Ship a `COMPLIANCE.md`.
 - **Secrets at rest**: admin cookies and proxy API keys are high-value credentials — **encrypt at rest** (e.g. Fernet/KMS), never log them, never return them in API responses, scope to admin only.
 - **Abuse**: rate limits + per-IP caps + the public-tier link cap mitigate the tool being used as a bulk scraper. Keep the audit log.
@@ -463,5 +496,6 @@ If you want stronger anti-competition protection and can accept **"source-availa
 1. **Strict "exactly 6h"**: the 60s sweep gives ≤60s tolerance. If truly exact, additionally gate access by `now() > expires_at` at read time (defense in depth) — recommend doing both.
 2. **Proxy providers**: Bright Data vs. Oxylabs — pick one to integrate first (interface stays generic).
 3. **Single-host vs. multi-host** at launch — determines whether MinIO lands in Phase 3 or later. Default: single-host + storage interface, MinIO deferred.
-4. **API-first coverage**: which platforms we integrate via official API (lawful path, §10) vs. scrape-only in v1 — affects Phase 1 scope.
+4. **API-first coverage**: API-first is now decided ([§4.3](#43-scraping-core--api-first-extractor-strategy)); still open is *which* platforms get a Tier-1 API integration in v1 vs. ship scrape-only initially (each API = credentials + quota + a per-platform client). Suggested v1 Tier-1: YouTube, Vimeo (well-documented, media-retrievable); Meta/TikTok/X/Reddit APIs staged as credentials/approval land; Snapchat scrape-only (no suitable API).
+5. **Attestation wording**: the exact legal text of the lawful-use checkbox needs counsel sign-off (versioned in `LawfulAttestation.text_version`).
 ```
