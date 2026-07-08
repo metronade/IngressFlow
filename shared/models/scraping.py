@@ -20,7 +20,10 @@ class Scrape(Base, UUIDPk, TimestampMixin):
         Enum(ScrapeStatus, native_enum=False, length=20), default=ScrapeStatus.QUEUED
     )
     config: Mapped[dict] = mapped_column(JSONB, default=dict)
-    share_token: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    # Nullable: the retention sweep nulls this out on expiry to invalidate the
+    # share link at the DB layer too, defense-in-depth alongside the
+    # read-time expires_at gate (PLAN.md §4.5).
+    share_token: Mapped[str | None] = mapped_column(String(64), unique=True, index=True, nullable=True)
     total_images: Mapped[int] = mapped_column(Integer, default=0)
     total_videos: Mapped[int] = mapped_column(Integer, default=0)
     total_bytes: Mapped[int] = mapped_column(BigInteger, default=0)

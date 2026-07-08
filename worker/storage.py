@@ -20,9 +20,8 @@ from sqlalchemy.orm import Session
 
 from shared.models import MediaFile, ScrapeItem
 from shared.models.enums import MediaType, SourceMethod
+from shared.storage import scrape_dir
 from worker.scraping.extractors import ExtractedMedia
-
-MEDIA_ROOT = os.environ.get("MEDIA_ROOT", "/data/scrapes")
 
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -35,7 +34,7 @@ def sanitize_category_name(name: str) -> str:
 
 
 def category_dir(scrape_id: str, category_name: str) -> str:
-    path = os.path.join(MEDIA_ROOT, str(scrape_id), sanitize_category_name(category_name))
+    path = os.path.join(scrape_dir(scrape_id), sanitize_category_name(category_name))
     os.makedirs(path, exist_ok=True)
     return path
 
