@@ -28,7 +28,7 @@ Distilling the brief into hard requirements and the constraints that drive the a
 | Config | Toggles: Video-only, Image-only, Include metadata JSON. |
 | Lawful-use gate | Mandatory attestation checkbox per scrape ("I hold the rights/lawful basis") — **submit is rejected without it**; the acceptance is recorded and transfers responsibility to the operator ([§4.7](#47-audit--lawful-use-attestation)). |
 | Audit | Append-only log of who started which scrape (actor/IP, URLs, config, attestation, extractor tier) — outlives the 6h media window ([§4.7](#47-audit--lawful-use-attestation)). |
-| Anti-blocking | Randomized 1.8–4.2s delays, UA rotation, optional residential proxy (per-GB billed), optional admin OAuth/cookie injection. Applied on the **Tier-2 scrape-fallback path only**. |
+| Anti-blocking | Randomized 1.8–4.2s delays, UA rotation, optional **self-hosted rotating proxy gateway** (own Docker service, no commercial provider — [§4.8](#48-self-hosted-proxy-gateway-decided--no-commercial-providers)), optional admin OAuth/cookie injection. Applied on the **Tier-2 scrape-fallback path only**. |
 | Live dashboard | WebSocket stats: progress `X/Y`, image/video counts, live total data size; per-URL status (green/yellow/red), per-URL `X/X images \| Y/Y videos`, copy-link button. Browser notification on batch completion. |
 | Storage | 6-hour disk cache; per-scrape unauthenticated share link; hard-delete + link invalidation at exactly 6h. |
 | Export | Single ZIP; folders named by category; gallery with ALL / by-category / by-link scopes, multi-select download, filtered-view ZIP, previews + native video. |
@@ -53,16 +53,17 @@ The proposed stack is sound. My changes are additive and low-risk; each is justi
 | Backend | FastAPI | **Keep.** Add **Pydantic v2** schemas, **Alembic** migrations. | FastAPI's async model suits the WS + I/O-bound scraping orchestration. |
 | Queue | Celery **or** RQ + Redis | **Celery** (decided). | Celery's `revoke`, per-task time limits, custom routing, and mature monitoring (Flower) matter for cancellable long-running batches. RQ is simpler but weaker on cancellation/observability. |
 | Task shape | (unspecified) | **One task per batch, iterating internally** — *not* a 100-task chain. | Keeps browser/proxy/cookie session affinity for the whole batch, makes pacing/human-mimicry trivial, simplifies cancellation and progress. See [§4.2](#42-the-worker-queue-the-core-design). |
-| Media acquisition | yt-dlp + Playwright | **API-first, scrape-fallback.** Official platform APIs (Tier 1) → yt-dlp / **gallery-dl** / Playwright (Tier 2). | The lawful path ([§10](#10-legal--compliance-risk)) requires trying ToS-compliant official APIs first; scraping (with residential proxy / OAuth-cookie auth) is the fallback only where no API is usable. `gallery-dl` added for image galleries. Full tiering in [§4.3](#43-scraping-core--api-first-extractor-strategy). |
+| Media acquisition | yt-dlp + Playwright | **API-first, scrape-fallback.** Official platform APIs (Tier 1) → yt-dlp / **gallery-dl** / Playwright (Tier 2). | The lawful path ([§10](#10-legal--compliance-risk)) requires trying ToS-compliant official APIs first; scraping (via the self-hosted proxy gateway + OAuth-cookie auth) is the fallback only where no API is usable. `gallery-dl` added for image galleries. **v1 ships scrape-only** (APIs built but inactive). Full tiering in [§4.3](#43-scraping-core--api-first-extractor-strategy). |
 | DB | PostgreSQL + SQLAlchemy | **Keep.** SQLAlchemy 2.0 async + Alembic. | — |
 | Cache/broker | Redis | **Keep — and use it for 3 jobs**: Celery broker/result backend, **Pub/Sub for WebSocket fan-out**, and rate-limit counters. | Pub/Sub decouples workers from the web layer (workers publish progress; the FastAPI WS process subscribes and forwards). Critical for the realtime design. |
-| Object storage | local disk | **Local volume now, behind a storage interface** so **MinIO/S3** can swap in later. | 6h retention + ZIP assembly + disk-full predictor all assume local disk today; the interface avoids a rewrite when scaling past one host. |
+| Object storage | local disk | **Single-host local volume** (decided), behind a `StorageBackend` interface. | Launch is **single-host** ([§12](#12-open-decisions)); 6h retention + ZIP assembly + disk-full predictor all assume local disk. The interface keeps MinIO/S3 as a *future* swap but **MinIO is not built in v1**. |
+| Proxy / anti-block | commercial residential (Bright Data/Oxylabs) | **Own Docker rotating proxy gateway** (decided), behind a generic `ProxyBackend` interface. | Self-hosted, no per-GB provider billing; per-batch exit-IP affinity + rotation. Residential quality depends on attached upstream exits — see the caveat in [§4.8](#48-self-hosted-proxy-gateway-decided--no-commercial-providers). |
 | Edge / TLS | (none) | **Nginx Proxy Manager (NPM)** at the host edge (decided). | NPM terminates TLS and routes `/`, `/api`, `/ws` (with WebSocket upgrade) to the `web` and `api` containers — GUI-managed certs. It sits *in front of* the compose stack, so it is not a stack service. **Traefik is optional internally** if we later want container-native service discovery; not required for v1. |
 | Auth | (implied) | **fastapi-users** (JWT + refresh) or Authlib. | Batteries-included registration, verification, password reset — don't hand-roll. |
 | Billing | Stripe-ready | **Stripe** (Checkout + Billing + webhooks). | Framework only in early phases; wire real products later. |
 | Observability | (none) | **Flower** (Celery), **structured JSON logs**, optional Prometheus/Grafana later. | The admin dashboard needs real metrics; don't invent them ad hoc. |
 
-**Net new services vs. the brief:** Flower (Celery ops) inside the stack, and Nginx Proxy Manager at the host edge (outside the stack). Everything else is a library choice inside existing containers.
+**Net new services vs. the brief:** Flower (Celery ops) and the self-hosted `proxy` gateway ([§4.8](#48-self-hosted-proxy-gateway-decided--no-commercial-providers)) inside the stack, and Nginx Proxy Manager at the host edge (outside the stack). Everything else is a library choice inside existing containers.
 
 ---
 
@@ -93,14 +94,19 @@ The proposed stack is sound. My changes are additive and low-risk; each is justi
                  ┌──────────────────────────────────────┴──────────────────────┴───────┐
                  │                 Celery Workers  (concurrency = 10)                    │
                  │  each slot runs ONE batch task → sequential link loop                 │
-                 │  [ delay(1.8–4.2s) → yt-dlp / gallery-dl / Playwright → checkpoint ]  │
-                 └───────────────────────────────┬───────────────────────────────────────┘
-                                                 │ writes media
-                                                 ▼
-                                    ┌────────────────────────────┐
-                                    │  Storage volume (local)     │  behind StorageBackend iface
-                                    │  /data/scrapes/<scrape_id>/ │  (S3/MinIO-swappable)
-                                    └────────────────────────────┘
+                 │  Tier-1 API (direct) ──or── Tier-2 [delay → yt-dlp/gallery-dl/        │
+                 │  Playwright → checkpoint]                                             │
+                 └───────┬───────────────────────────────────────────────┬──────────────┘
+                writes   │ media                          Tier-2 outbound │ (scrape only)
+                         ▼                                                ▼
+            ┌────────────────────────────┐              ┌────────────────────────────────┐
+            │  Storage volume (local)     │              │  proxy  (self-hosted gateway)  │
+            │  /data/scrapes/<scrape_id>/ │              │  rotating exit IPs, 1 IP/batch │
+            │  behind StorageBackend iface│              │  behind ProxyBackend iface     │
+            └────────────────────────────┘              └───────────────┬────────────────┘
+                                                             upstream exits (operator-fed) │
+                                                                                           ▼
+                                                                                     internet
 
         ┌───────────────────────────────────────────────────────────────────┐
         │  Celery Beat (scheduler):                                           │
@@ -111,7 +117,7 @@ The proposed stack is sound. My changes are additive and low-risk; each is justi
 ```
 
 ### 3.1 Container inventory (Docker Compose services)
-`web` (Next.js) · `api` (FastAPI: REST + WS) · `worker` (Celery, `--concurrency=10`) · `beat` (Celery Beat) · `redis` · `postgres` · `flower` (admin/ops) · (later: `minio`).
+`web` (Next.js) · `api` (FastAPI: REST + WS) · `worker` (Celery, `--concurrency=10`) · `beat` (Celery Beat) · `proxy` (self-hosted rotating gateway, [§4.8](#48-self-hosted-proxy-gateway-decided--no-commercial-providers)) · `redis` · `postgres` · `flower` (admin/ops). Single-host; **no `minio` in v1** (`StorageBackend` interface keeps it a future option).
 
 **TLS/edge is handled by Nginx Proxy Manager running in front of the host**, outside this stack (its own container/host). The compose stack exposes `web` and `api` to NPM; NPM owns certificates and public routing.
 
@@ -177,16 +183,18 @@ def run_batch(self, scrape_id: str):
 
 The lawful path ([§10](#10-legal--compliance-risk)) drives the extractor order: **official APIs first, scraping only as fallback where no usable API exists.** Per URL we resolve the platform, then walk tiers top-down; **first success wins**; dedup by resolved media URL/content hash.
 
+> **v1 launch: Tier-1 is built but inactive (decided).** We start **scrape-only for testing** — no API credentials configured means every URL falls straight through to Tier 2. The Tier-1 layer (per-platform clients, resolver dispatch) is present so it can be **switched on later per platform simply by adding credentials in admin — no redeploy, no code change**. The rest of this section describes the target behaviour once APIs are enabled.
+
 **Tier 1 — Official platform API (preferred, ToS-compliant).** The only route that doesn't breach platform terms. Attempted first whenever credentials are configured and the API can serve the asset:
 - **YouTube Data API**, **Vimeo API**, **Meta Graph API** (Instagram/Facebook), **TikTok Research/Display API**, **X API**, **Reddit API**.
 - APIs are rate-limited and coverage is partial (some content/media isn't retrievable, some platforms — e.g. Snapchat — have no suitable public API). Missing/failed API access falls through to Tier 2.
-- API credentials are admin-configured per platform and stored encrypted (same handling as cookies, [§10](#10-legal--compliance-risk)).
+- API credentials are admin-configured per platform and stored encrypted as `PlatformCredential` ([§10](#10-legal--compliance-risk)).
 
-**Tier 2 — Fallback scraping (used only when no API is provided/usable for that platform).** This is where legal risk concentrates and where **residential proxy + OAuth/cookie auth** apply:
+**Tier 2 — Fallback scraping (used only when no API is provided/usable for that platform; the *only* active path at v1 launch).** This is where legal risk concentrates and where the **self-hosted proxy gateway ([§4.8](#48-self-hosted-proxy-gateway-decided--no-commercial-providers)) + OAuth/cookie auth** apply:
 - **yt-dlp** — video (YouTube, TikTok, Vimeo, X, Facebook, Reddit video); highest-quality format (`bestvideo+bestaudio/best`).
 - **gallery-dl** — image sets/carousels (Instagram, Reddit galleries, X media, Snapchat spotlight).
 - **Playwright** — JS-walled / login-gated content; also the vehicle for **admin OAuth/cookie injection** (Instagram/X session) and dynamically-rendered media.
-- Residential proxy and cookie/OAuth auth are **admin-gated, off by default**, and only ever engaged on the Tier-2 path.
+- The self-hosted proxy gateway and cookie/OAuth auth are **admin-gated, off by default**, and only ever engaged on the Tier-2 path.
 
 Each extractor records **which tier/method served the item** (`MediaFile.source_method` = `api` \| `ytdlp` \| `gallerydl` \| `playwright`) so the audit log ([§4.7](#47-audit--lawful-use-attestation)) and per-platform health view can show the API-vs-scrape mix and where fallback is being hit.
 
@@ -204,7 +212,9 @@ This keeps workers stateless w.r.t. connections and lets multiple browser tabs /
 ### 4.5 Storage, retention & share links
 - Layout: `/data/scrapes/{scrape_id}/{category}/{filename}` — mirrors the ZIP structure, so export is a straight `zipstream` walk (no repacking, low memory).
 - Share link: `share_token` (unguessable) on the `Scrape` row; unauthenticated read access to gallery + ZIP until expiry.
-- **Retention sweep** (Celery Beat, every 60s for tight tolerance on "exactly 6h"): find scrapes past `expires_at`, hard-delete the directory, null the media, invalidate `share_token`, mark `EXPIRED`.
+- **Two-layer expiry (decided — do both):**
+  1. **Retention sweep** (Celery Beat, every 60s): find scrapes past `expires_at`, hard-delete the directory, null the media, invalidate `share_token`, mark `EXPIRED`. This is what actually frees disk; ≤60s tolerance on the physical delete.
+  2. **Read-time gate** (defense in depth): every gallery/share/ZIP/WS read checks `now() > expires_at` and returns 410 Gone *before* touching files — so access is cut off at the exact second even if the sweep hasn't run yet. No window where expired data is still reachable.
 - `expires_at = created_at + retention_hours` (retention configurable by admin).
 
 ### 4.6 Disk-full predictor (admin)
@@ -223,6 +233,18 @@ The operator — not the tool — carries the rights ([§10](#10-legal--complian
 
 Together these answer "who started which scrape, under what asserted rights" — the two questions a broadcaster's legal team and any complainant will ask.
 
+### 4.8 Self-hosted proxy gateway (decided — no commercial providers)
+
+**Decision:** ship our **own Docker-based rotating proxy gateway** as a stack service. Bright Data / Oxylabs are dropped for now; no per-GB billing to a third party. The `ProxyBackend` interface stays generic so a commercial provider *could* be plugged in later, but v1 is self-hosted only.
+
+**What it is:** a `proxy` container — a rotating forward-proxy gateway (HTTP/SOCKS) that sits between the workers and the internet. Workers on the **Tier-2 scrape path** route outbound requests through it (Tier-1 API calls go direct — APIs don't need proxying). Responsibilities:
+- **Exit-IP pool + rotation:** rotate among a configurable set of upstream exit endpoints.
+- **Per-batch session affinity:** pin one exit IP for the lifetime of a batch (matches the anti-block model in [§4.2](#42-the-worker-queue-the-core-design) — one IP per sequential chain), rotate *across* batches.
+- **Health checks + eviction** of dead/blocked exits, so a burned IP is dropped from rotation.
+- **Bandwidth metering** per scrape (retained on `UsageEvent` for the disk predictor and internal accounting — **not** for provider billing anymore).
+
+**Honest caveat on "residential":** a Docker container cannot itself *manufacture* residential IPs — the "residential" property comes from an IP living on a consumer ISP. A pure single-host deployment routes through the **host's own (datacenter/VPS) IP**, which platforms detect more easily. To get genuinely residential exits, the gateway must be **fed upstream exit nodes** the operator controls — e.g. mobile LTE modems/dongles, home endpoints, or self-hosted SOCKS/VPN exits. So the gateway's *design* is provider-agnostic rotation; the *residential quality* depends entirely on what exits you attach. This is a deliberate cost/control trade-off vs. the dropped commercial providers, and it's an operator responsibility to document ([§10](#10-legal--compliance-risk)). Admin toggle stays: proxy on/off, per-platform, off by default.
+
 ---
 
 ## 5. Data Model (core entities)
@@ -239,7 +261,8 @@ ScrapeItem      id, scrape_id, category_id, url, platform, status, images_found,
 MediaFile       id, item_id, category_id, type[image|video], path, bytes, width, height,
                 duration, source_url, source_method[api|ytdlp|gallerydl|playwright],
                 checksum (dedup), metadata_json
-UsageEvent      id, user_id, ip, scrape_id, links_count, bytes, proxy_gb, created_at   (billing/limits)
+UsageEvent      id, user_id, ip, scrape_id, links_count, bytes, proxy_bytes, exit_ip,
+                created_at            # proxy_bytes = internal metering only (no provider billing)
 Setting         key, value        (max_links, max_scrapes_per_ip_24h, retention_hours, proxy_enabled…)
 CmsPage         slug[impressum|tos|privacy], content_md, updated_at, updated_by
 PlatformCredential  platform, kind[api_key|oauth_token|cookie], secret_blob(encrypted),
@@ -268,7 +291,6 @@ IngressFlow/
 ├── PLAN.md
 ├── LICENSE                      # AGPL-3.0 (see §11)
 ├── CLA.md                       # contributor license agreement (enables dual-licensing)
-├── docs/npm-proxy-hosts.md      # NPM edge config reference (TLS + routing, host-level)
 ├── web/                         # Next.js
 │   ├── Dockerfile
 │   ├── app/                     # App Router: /, /scrape, /gallery/[token], /admin, /pricing, /(legal)
@@ -298,12 +320,18 @@ IngressFlow/
 │   └── scraping/
 │       ├── extractors/          # api/ (per-platform Tier-1), ytdlp.py, gallerydl.py, playwright.py
 │       ├── resolver.py          # url → platform; picks Tier-1 API vs Tier-2 fallback
-│       ├── session.py           # UA rotation, proxy, cookie injection
+│       ├── session.py           # UA rotation, ProxyBackend client, cookie injection
 │       └── parser.py            # category-header text parsing
+├── proxy/                       # self-hosted rotating proxy gateway (§4.8)
+│   ├── Dockerfile
+│   ├── gateway.py               # rotation, per-batch IP affinity, health-check/eviction
+│   └── exits.example.yml        # operator-supplied upstream exit nodes (LTE/SOCKS/VPN)
 ├── shared/                      # models/schemas shared by api + worker (single source of truth)
 └── docs/
     ├── ARCHITECTURE.md
     ├── DEPLOYMENT.md
+    ├── PROXY.md                 # attaching upstream exits + residential caveat (§4.8)
+    ├── npm-proxy-hosts.md       # NPM edge config (TLS + routing)
     └── COMPLIANCE.md            # GDPR / ToS / takedown process
 ```
 
@@ -331,10 +359,18 @@ services:
   worker:
     build: ./worker
     command: celery -A celery_app worker --concurrency=10 -Q scrapes --loglevel=info
-    environment: [same DB/REDIS as api]
+    environment:
+      - <same DB/REDIS as api>
+      - PROXY_GATEWAY_URL=http://proxy:8888   # Tier-2 scrape traffic routed here; APIs go direct
     volumes: ["media:/data/scrapes"]
-    depends_on: [redis, postgres]
+    depends_on: [redis, postgres, proxy]
     # Playwright browsers baked into the image; consider shm_size: 1gb
+
+  proxy:                                       # self-hosted rotating gateway (§4.8)
+    build: ./proxy
+    expose: ["8888"]                           # internal only — never published to the host edge
+    volumes: ["./proxy/exits.yml:/app/exits.yml:ro"]   # operator-supplied upstream exits
+    # No commercial provider. Residential quality depends on attached exits — see §4.8.
 
   beat:
     build: ./worker
@@ -392,9 +428,10 @@ Each phase ends with something demonstrable. Rough sizing assumes a small team; 
 ### Phase 1 — Acquisition engine (headless, no UI polish)
 - Category-header **text parser** (`L1234` grouping); URL → platform **resolver**.
 - `run_batch` task ([§4.2](#42-the-worker-queue-the-core-design)): sequential loop, jitter delays, UA rotation, per-item checkpointing, cancellation, resume-on-crash.
-- **API-first tiering** ([§4.3](#43-scraping-core--api-first-extractor-strategy)): Tier-1 official APIs where credentials exist → Tier-2 yt-dlp / gallery-dl / Playwright fallback; record `source_method` per item; config toggles; media written to `/data/scrapes/...`.
+- **Tiering built, but API ships inactive** ([§4.3](#43-scraping-core--api-first-extractor-strategy)): the resolver + `ProxyBackend` + Tier-1/Tier-2 dispatch are all in place, but **v1 launches scrape-only for testing** — no API credentials configured, so every URL takes the Tier-2 path. Tier-1 activates later per platform purely by adding credentials in admin, **no redeploy**. Record `source_method` per item; config toggles; media to `/data/scrapes/...`.
+- **Self-hosted proxy gateway** ([§4.8](#48-self-hosted-proxy-gateway-decided--no-commercial-providers)): `proxy` service + `ProxyBackend` client; Tier-2 traffic routed through it with per-batch exit-IP affinity; runnable with zero exits (direct/host IP) and with operator-attached exits.
 - **Attestation gate + audit log** ([§4.7](#47-audit--lawful-use-attestation)): submit rejected without accepted attestation; every scrape start written to append-only `AuditLog`. (Build the enforcement here, at the API boundary, so no path can bypass it.)
-- **Exit:** a batch with a valid attestation runs (API-first, scrape-fallback) across 10 concurrent slots; a batch *without* attestation is rejected; audit rows recorded; media on disk in ZIP-ready layout.
+- **Exit:** a batch with a valid attestation runs **scrape-only** across 10 concurrent slots through the proxy gateway; a batch *without* attestation is rejected; audit rows recorded; media on disk in ZIP-ready layout. (Flipping on a Tier-1 API credential later must reroute that platform to the API with no code change.)
 
 ### Phase 2 — Realtime dashboard
 - Redis Pub/Sub → FastAPI WS hub → browser ([§4.4](#44-realtime-pipeline-websockets)).
@@ -417,7 +454,7 @@ Each phase ends with something demonstrable. Rough sizing assumes a small team; 
 ### Phase 5 — Admin dashboard
 - Live IO/CPU/disk (host metrics); Flower behind admin auth.
 - **Disk-full predictor** ([§4.6](#46-disk-full-predictor-admin)) with trend chart.
-- Settings (limits, retention); CMS for Impressum/ToS/Privacy; **encrypted `PlatformCredential` UI** for Tier-1 API keys *and* Tier-2 OAuth/cookies; proxy toggle + per-GB usage accounting.
+- Settings (limits, retention); CMS for Impressum/ToS/Privacy; **encrypted `PlatformCredential` UI** for Tier-1 API keys *and* Tier-2 OAuth/cookies; **self-hosted proxy toggle** (on/off per platform) + exit-pool health view + internal bandwidth metering ([§4.8](#48-self-hosted-proxy-gateway-decided--no-commercial-providers)).
 - **Audit log viewer** (search/export who-scraped-what) and **per-platform health** incl. the API-vs-fallback mix (`source_method`).
 - **Exit:** admin can tune limits, edit legal pages, add API keys/cookies, read the disk forecast, and query the audit log.
 
@@ -491,11 +528,13 @@ If you want stronger anti-competition protection and can accept **"source-availa
 - ✅ **License** = AGPLv3 + CLA.
 - ✅ **Edge/TLS** = Nginx Proxy Manager at the host; Traefik optional internal only.
 - ✅ **Public tier** = full gallery/export, not account-bound, via dynamic link; limited only by URLs/scrape and scrapes/IP/24h.
+- ✅ **Exactly 6h** = do both — 60s retention sweep *and* read-time `now() > expires_at` gate ([§4.5](#45-storage-retention--share-links)).
+- ✅ **Proxy** = own Docker rotating gateway, no commercial provider ([§4.8](#48-self-hosted-proxy-gateway-decided--no-commercial-providers)); `ProxyBackend` iface keeps a provider swappable later.
+- ✅ **Single-host** = yes; local-disk storage behind `StorageBackend`, **MinIO not built in v1**.
+- ✅ **API activation** = v1 ships **scrape-only for testing**; Tier-1 APIs built but inactive, enabled later per platform via admin credentials, no redeploy ([§4.3](#43-scraping-core--api-first-extractor-strategy)).
 
 **Still open:**
-1. **Strict "exactly 6h"**: the 60s sweep gives ≤60s tolerance. If truly exact, additionally gate access by `now() > expires_at` at read time (defense in depth) — recommend doing both.
-2. **Proxy providers**: Bright Data vs. Oxylabs — pick one to integrate first (interface stays generic).
-3. **Single-host vs. multi-host** at launch — determines whether MinIO lands in Phase 3 or later. Default: single-host + storage interface, MinIO deferred.
-4. **API-first coverage**: API-first is now decided ([§4.3](#43-scraping-core--api-first-extractor-strategy)); still open is *which* platforms get a Tier-1 API integration in v1 vs. ship scrape-only initially (each API = credentials + quota + a per-platform client). Suggested v1 Tier-1: YouTube, Vimeo (well-documented, media-retrievable); Meta/TikTok/X/Reddit APIs staged as credentials/approval land; Snapchat scrape-only (no suitable API).
-5. **Attestation wording**: the exact legal text of the lawful-use checkbox needs counsel sign-off (versioned in `LawfulAttestation.text_version`).
+1. **Which platforms get a Tier-1 API client first**, once we move past scrape-only testing. Suggested order when enabling: YouTube, Vimeo (well-documented, media-retrievable); then Meta/TikTok/X/Reddit as credentials/approval land; Snapchat stays scrape-only (no suitable API).
+2. **Attestation wording**: the exact legal text of the lawful-use checkbox needs counsel sign-off (versioned in `LawfulAttestation.text_version`).
+3. **Upstream proxy exits**: what exit nodes the operator attaches to the gateway (LTE modems / home endpoints / SOCKS/VPN) — determines the real "residential" quality ([§4.8](#48-self-hosted-proxy-gateway-decided--no-commercial-providers)); pure single-host = host/datacenter IP.
 ```
