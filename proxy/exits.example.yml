@@ -1,15 +1,20 @@
-# Upstream exit nodes for the self-hosted proxy gateway (PLAN.md §4.8).
-# Not read by the Phase A stub gateway yet — Phase B wires this in.
+# Upstream SOCKS5 exit nodes for the self-hosted proxy gateway (PLAN.md §4.8).
 #
-# Each entry is one exit the gateway can rotate through and pin per batch.
+# Each entry is one exit the gateway can rotate through and pin per batch
+# (one exit per scrape, for the whole sequential chain — PLAN.md §4.2).
 # "residential" quality depends entirely on what you attach here (see the
 # honest caveat in PLAN.md §4.8) — e.g. a mobile LTE modem/dongle, a home
-# endpoint you control, or a self-hosted SOCKS/VPN exit. Without any entries,
-# Tier-2 scrape traffic exits via the host's own (datacenter) IP.
-exits:
-  - name: example-lte-modem
-    type: socks5
-    host: 192.168.1.50
-    port: 1080
-    # username: user
-    # password: pass
+# endpoint you control, or a self-hosted SOCKS/VPN exit.
+#
+# The v1 default is an empty list, on purpose: with zero (or zero *healthy*)
+# exits, Tier-2 scrape traffic falls back to direct passthrough through the
+# host's own (datacenter) IP — see docs/PROXY.md for how to attach real exits.
+exits: []
+
+# Example entry (uncomment and edit to add a real exit):
+# exits:
+#   - name: example-lte-modem
+#     host: 192.168.1.50
+#     port: 1080
+#     # username: user
+#     # password: pass
