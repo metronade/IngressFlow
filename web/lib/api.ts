@@ -1,3 +1,5 @@
+import { getToken } from "@/lib/token";
+
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "";
 
 export class ApiError extends Error {
@@ -8,11 +10,20 @@ export class ApiError extends Error {
   }
 }
 
+function authHeaders(): Record<string, string> {
+  const token = getToken();
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, init);
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}) as { detail?: string });
-    throw new ApiError(res.status, body.detail ?? `Request failed (${res.status})`);
+    const body = await res.json().catch(() => ({}) as { detail?: unknown });
+    // fastapi-users sometimes returns a structured object (e.g.
+    // {code, reason}) instead of a plain string for validation errors.
+    const detail = body.detail;
+    const message = typeof detail === "string" ? detail : detail ? JSON.stringify(detail) : `Request failed (${res.status})`;
+    throw new ApiError(res.status, message);
   }
   return res.json() as Promise<T>;
 }
@@ -33,12 +44,71 @@ export type SubmitResponse = {
 export function submitScrape(rawText: string, config: ScrapeConfig, attestationVersion: string) {
   return request<SubmitResponse>("/api/scrapes", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify({
       raw_text: rawText,
       config,
       attestation: { accepted: true, text_version: attestationVersion },
     }),
+  });
+}
+
+// -- auth (PLAN.md §9 Phase 4) --------------------------------------------
+
+export type UserRead = {
+  id: string;
+  email: string;
+  is_active: boolean;
+  is_superuser: boolean;
+  is_verified: boolean;
+  role: "public" | "free" | "paid" | "admin";
+  credit_balance: number;
+};
+
+export async function login(email: string, password: string): Promise<{ access_token: string }> {
+  const res = await fetch(`${API_BASE}/api/auth/jwt/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ username: email, password }),
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}) as { detail?: string });
+    throw new ApiError(res.status, typeof body.detail === "string" ? body.detail : "Login failed.");
+  }
+  return res.json();
+}
+
+export function register(email: string, password: string) {
+  return request<UserRead>("/api/auth/register", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+}
+
+export function getMe() {
+  return request<UserRead>("/api/users/me", { headers: authHeaders() });
+}
+
+export type ScrapeHistoryItem = {
+  scrape_id: string;
+  status: string;
+  share_token: string | null;
+  total_images: number;
+  total_videos: number;
+  total_bytes: number;
+  created_at: string;
+  expires_at: string;
+};
+
+export function getMyScrapes() {
+  return request<ScrapeHistoryItem[]>("/api/me/scrapes", { headers: authHeaders() });
+}
+
+export function createCheckout() {
+  return request<{ checkout_url: string }>("/api/billing/checkout", {
+    method: "POST",
+    headers: authHeaders(),
   });
 }
 
