@@ -1,3 +1,4 @@
+from datetime import datetime
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -45,5 +46,16 @@ class ScrapeStatusResponse(BaseModel):
     total_images: int
     total_videos: int
     total_bytes: int
-    share_token: str
+    share_token: str | None  # null once the retention sweep has expired this scrape (PLAN.md §4.5)
     items: list[ScrapeItemStatusOut]
+
+
+class ScrapeHistoryOut(BaseModel):
+    scrape_id: UUID
+    status: str
+    share_token: str | None
+    total_images: int
+    total_videos: int
+    total_bytes: int
+    created_at: datetime
+    expires_at: datetime
