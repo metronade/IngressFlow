@@ -308,24 +308,28 @@ IngressFlow/
 ├── PLAN.md
 ├── LICENSE                      # AGPL-3.0 (see §11)
 ├── CLA.md                       # contributor license agreement (enables dual-licensing)
-├── web/                         # Next.js
+├── web/                         # Next.js (plain Tailwind for now — shadcn/ui deferred, §12)
 │   ├── Dockerfile
-│   ├── app/                     # App Router: /, /scrape, /gallery/[token], /admin, /pricing, /(legal)
-│   ├── components/ui/           # shadcn/ui
-│   ├── components/dashboard/    # live stats, url list, gallery
-│   ├── lib/ws.ts                # WebSocket client + reconnect
-│   └── lib/api.ts               # TanStack Query hooks
+│   ├── app/
+│   │   ├── page.tsx              # input form: textarea + config toggles + attestation checkbox
+│   │   ├── scrape/[token]/       # live dashboard: WS-driven stats, per-item status, cancel
+│   │   └── gallery/[token]/      # ALL/category/single-link scopes, multiselect, lightbox
+│   ├── lib/ws.ts                 # useShareSocket: WS client, exponential-backoff reconnect,
+│   │                             # treats close code 4410 (expired) as terminal, not retryable
+│   └── lib/api.ts                # fetch helpers for /api/scrapes and /api/share/*
 ├── api/                         # FastAPI
 │   ├── Dockerfile
 │   ├── app/
 │   │   ├── main.py
-│   │   ├── api/routes/          # health, scrapes (submit/status/cancel); auth, gallery, admin,
-│   │   │                        # billing, cms, share, takedown land in later phases
-│   │   ├── ws/                  # connection hub + Redis Pub/Sub subscriber (health echo in v1;
-│   │   │                        # real progress hub is Phase C, §4.4)
-│   │   ├── schemas/              # Pydantic v2 (ScrapeSubmitRequest/Response, …)
-│   │   ├── services/             # audit.py (append-only AuditLog writes), tasks.py (Celery
-│   │   │                         # client: enqueue_run_batch, request_cancel)
+│   │   ├── api/routes/          # health, scrapes (submit/status/cancel), share (status,
+│   │   │                        # categories, media list/file, export); auth, admin, billing,
+│   │   │                        # cms, takedown land in later phases
+│   │   ├── ws/                  # health echo + share.py — the real progress hub (§4.4):
+│   │   │                        # initial snapshot on connect, then forwards Redis Pub/Sub
+│   │   │                        # (progress/done) until the client disconnects
+│   │   ├── schemas/              # Pydantic v2 (scrape submit/status, share status/media/export)
+│   │   ├── services/             # audit.py, tasks.py (enqueue/cancel), expiry.py (410 gate —
+│   │   │                         # shared by every share route), export.py (streamed ZIP)
 │   │   ├── core/                 # config, security, deps
 │   │   └── db/                   # async session (asyncpg) + alembic env
 │   └── alembic/
@@ -333,12 +337,13 @@ IngressFlow/
 │   ├── Dockerfile
 │   ├── celery_app.py             # broker/backend, beat_schedule, visibility_timeout (see below)
 │   ├── db.py                     # sync SQLAlchemy session (psycopg) — Celery tasks stay sync
-│   ├── storage.py                # disk layout, checksum dedup (hardlink), category sanitization
+│   ├── storage.py                # write-side: checksum dedup (hardlink), category sanitization
 │   ├── tasks/
 │   │   ├── batch.py              # run_batch (§4.2)
 │   │   ├── watchdog.py           # requeues a batch whose worker died mid-run — the actual
 │   │   │                         # fast-recovery path; see the crash-resilience note below
-│   │   ├── retention.py          # 6h sweep (§4.5) — Phase C
+│   │   ├── retention.py          # 6h sweep (§4.5): hard-delete dir, delete MediaFile rows,
+│   │   │                         # null share_token, zero aggregates, mark EXPIRED — Beat, 60s
 │   │   └── predictor.py          # disk forecast (§4.6) — Phase E
 │   └── scraping/
 │       ├── resolver.py           # url → platform; picks tier (API vs scrape) AND egress
@@ -356,7 +361,11 @@ IngressFlow/
 │   ├── models/                   # SQLAlchemy (all 12 entities, §5)
 │   ├── parsing.py                # category-header text parser — lives here, not under
 │   │                             # worker/scraping/, since the API needs it at submit time
-│   └── crypto.py                 # Fernet encrypt/decrypt for PlatformCredential.secret_blob
+│   ├── crypto.py                 # Fernet encrypt/decrypt for PlatformCredential.secret_blob
+│   └── storage.py                # MEDIA_ROOT + scrape_dir/delete_scrape_dir — the seam behind
+│                                  # which local disk could later become S3/MinIO (§12); used by
+│                                  # both worker (retention delete) and api (gallery/export reads,
+│                                  # which is why api also mounts the media volume, §7)
 └── docs/
     ├── ARCHITECTURE.md
     ├── DEPLOYMENT.md
@@ -386,6 +395,7 @@ services:
     environment:
       - DATABASE_URL=postgresql+asyncpg://ingressflow:ingressflow@postgres:5432/ingressflow
       - REDIS_URL=redis://redis:6379/0
+    volumes: ["media:/data/scrapes"]   # read-only in practice — api serves gallery/export (§4.5)
     depends_on: [postgres, redis]
 
   worker:
@@ -430,7 +440,7 @@ volumes: { media: {}, redis: {}, pgdata: {} }
 
 Prod overlay (`docker-compose.prod.yml`): secrets, resource limits, `worker` replicas or higher concurrency behind the 10-slot policy, MinIO if introduced, log shipping. (TLS/certs are NPM's job, not the overlay's.)
 
-> **Note on the media volume:** `worker` writes media; `api` serves gallery/ZIP. In v1 both mount the shared `media` volume (single host). When scaling to multiple hosts, this is exactly the seam where the `StorageBackend` interface swaps local disk for MinIO/S3.
+> **Note on the media volume:** `worker` writes media; `api` serves gallery/ZIP. In v1 both mount the shared `media` volume (single host) — **this was missed in the actual `docker-compose.yml` until Phase C's end-to-end testing caught it** (every share/gallery/export read failed with `FileNotFoundError` until the `api` service got the volume too). When scaling to multiple hosts, this is exactly the seam where the `StorageBackend` interface swaps local disk for MinIO/S3.
 
 ---
 
@@ -468,17 +478,23 @@ Each phase ends with something demonstrable. Rough sizing assumes a small team; 
 
 **Verified via Docker (real content, not mocks):** yt-dlp fetched a real YouTube video at full quality (4K confirmed on one run); gallery-dl fetched a real direct image; the yt-dlp → gallery-dl cascade required excluding yt-dlp's own generic extractor (it otherwise claims *any* URL is "supported" and then fails instead of deferring — see `ytdlp.py`); checksum dedup correctly hard-linked a repeated URL across two categories instead of storing it twice; the attestation gate rejected an unchecked submission (403) and the 100-link cap rejected an oversized batch (422); cancellation stopped a batch mid-chain leaving the rest `PENDING`; a `SIGKILL`'d worker's batch was correctly picked back up by `tasks.watchdog.requeue_stuck_batches` with no duplicate processing; the proxy gateway was verified both in direct-passthrough mode and — using a throwaway test SOCKS5 container — with a real upstream exit, confirming session-to-exit pinning and CONNECT tunneling both work.
 
-### Phase 2 — Realtime dashboard
+### Phase 2 — Realtime dashboard — ✅ done (merged with Phase 3 into execution-plan "Phase C")
 - Redis Pub/Sub → FastAPI WS hub → browser ([§4.4](#44-realtime-pipeline-websockets)).
 - Input UI (textarea + toggles + **mandatory lawful-use checkbox** wired to the Phase-1 gate), top-bar stats, per-URL list with status icons + copy-link, queue position.
 - Web Notification API on completion.
 - **Exit:** paste links, accept attestation, watch live progress + completion notification end to end; submit is blocked if the checkbox is unchecked.
 
-### Phase 3 — Storage, retention, export, gallery
+**Verified via a real Playwright browser driving the actual UI** (not just curl): submit correctly disabled until the attestation checkbox is checked; live WS-driven DOM updates observed reaching `running` then a terminal status without a page reload; browser Notification fires on completion. WS close code **4410** (a private-range app code, the WS equivalent of the HTTP 410 gate) is what the client uses to distinguish "expired, stop reconnecting" from "transient disconnect, retry with backoff."
+
+### Phase 3 — Storage, retention, export, gallery — ✅ done
 - `StorageBackend` interface (local impl); streamed ZIP export (category folders).
 - Retention sweep (6h hard-delete + share-link invalidation); share-link read access.
 - Gallery: ALL / category / single-link scopes, multi-select download, filtered-view ZIP, image previews + native video.
 - **Exit:** share link works unauthenticated; ZIP structure correct; data provably gone at 6h.
+
+**Verified via Docker + a real browser:** category-filtered and multi-select ZIP exports both produce correct archives (checked with Python's `zipfile`, not just an HTTP 200); a single-file endpoint serves the right `Content-Type` and honors HTTP Range (required for `<video>` seeking — `FileResponse` gives this for free); the retention sweep was run directly against a force-expired test scrape and confirmed to hard-delete the directory, delete its `MediaFile` rows, null `share_token`, zero the aggregate counters, and mark `EXPIRED`; both the HTTP 410 gate and the WS 4410 close were confirmed on that same expired scrape, and the gallery/dashboard UI renders a clean "Link expired" state rather than erroring.
+
+**Bug found and fixed by this testing, not by inspection:** the `api` service was never given access to the `media` volume in `docker-compose.yml` — Phase A/B never needed it, since only the worker wrote files. Every share/gallery/export read failed with `FileNotFoundError` until this was added (§7's blueprint already *described* both services sharing the volume — it just hadn't been wired into the real compose file yet).
 
 ### Phase 4 — Users, tiers & monetization
 - `fastapi-users` auth (register/verify/reset); roles.
@@ -572,4 +588,4 @@ If you want stronger anti-competition protection and can accept **"source-availa
 1. **Which platforms get a Tier-1 API client first**, once we move past scrape-only testing. Suggested order when enabling: YouTube, Vimeo (well-documented, media-retrievable); then Meta/TikTok/X/Reddit as credentials/approval land; Snapchat stays scrape-only (no suitable API).
 2. **Attestation wording**: the exact legal text of the lawful-use checkbox needs counsel sign-off (versioned in `LawfulAttestation.text_version`).
 3. **Upstream proxy exits**: what exit nodes the operator attaches to the gateway (LTE modems / home endpoints / SOCKS/VPN) — determines the real "residential" quality ([§4.8](#48-self-hosted-proxy-gateway-decided--no-commercial-providers)); pure single-host = host/datacenter IP.
-```
+4. **shadcn/ui**: Phase C shipped the frontend with plain Tailwind (no shadcn/ui components) to keep scope on functional correctness — every page/interaction was verified with a real Playwright browser instead. Adopting shadcn/ui for visual polish is still open and can happen incrementally, component by component, without touching the data-fetching/WS logic.

@@ -9,12 +9,14 @@ Full architecture, phased delivery plan, and license rationale: **[PLAN.md](PLAN
 
 ## Status
 
-**Phase B — Acquisition engine: done.** A scrape batch runs end to end —
-parsed, gated behind a mandatory lawful-use attestation, processed
-sequentially through a real yt-dlp → gallery-dl → Playwright cascade behind
-a self-hosted rotating proxy gateway, checkpointed to Postgres with
-checksum dedup, audit-logged, cancellable, and resumable if the worker
-crashes mid-batch. All verified against real content via Docker, not mocks.
+**Phase C — Dashboard + gallery: done.** There's a real UI now: paste links,
+watch them scrape live over a WebSocket, get a browser notification on
+completion, then browse the results in a gallery (all / by category / by
+single link), multi-select a download, or export a filtered view as a ZIP.
+Retention is enforced two ways — a background sweep that hard-deletes
+expired data, and a read-time gate that returns 410/closes the socket the
+instant a link expires, even before the sweep runs. Verified with a real
+Playwright browser clicking through the actual UI, not just curl.
 
 Delivery phases (see [PLAN.md §9](PLAN.md#9-phased-delivery-plan) for detail):
 
@@ -22,8 +24,8 @@ Delivery phases (see [PLAN.md §9](PLAN.md#9-phased-delivery-plan) for detail):
 |---|---|---|
 | A | Foundations & data model | ✅ done |
 | B | Acquisition engine (parser, worker queue, proxy gateway, lawful-use gate) | ✅ done |
-| C | Dashboard + gallery (realtime WS, storage, retention, export) | next |
-| D | Accounts, tiers & monetization | planned |
+| C | Dashboard + gallery (realtime WS, storage, retention, export) | ✅ done |
+| D | Accounts, tiers & monetization | next |
 | E | Admin & observability | planned |
 | F | Hardening & launch | planned |
 
@@ -39,11 +41,11 @@ Delivery phases (see [PLAN.md §9](PLAN.md#9-phased-delivery-plan) for detail):
 ## Repository layout
 
 ```
-api/        FastAPI service (REST, WebSocket, Alembic migrations, scrape submit/status/cancel)
-worker/     Celery worker + beat (run_batch, crash-recovery watchdog, scraping cascade)
+api/        FastAPI service — scrape submit/status/cancel, share (status/media/export), WS hub
+worker/     Celery worker + beat (run_batch, crash-recovery watchdog, retention sweep, cascade)
 proxy/      Self-hosted rotating proxy gateway (real: CONNECT/HTTP, SOCKS5 exits, sticky sessions)
-web/        Next.js frontend
-shared/     Models, category-header parser, credential encryption — single source of truth
+web/        Next.js frontend — input form, live dashboard, gallery (plain Tailwind, no shadcn/ui yet)
+shared/     Models, parser, credential encryption, disk-layout helpers — single source of truth
 docs/       Deployment/architecture reference docs
 PLAN.md     Architecture & phased delivery plan
 ```
@@ -80,11 +82,17 @@ In production, none of these ports are published to the host — Nginx Proxy
 Manager sits in front and is the only public entrypoint (see
 [docs/npm-proxy-hosts.md](docs/npm-proxy-hosts.md)).
 
-## Submitting a scrape
+## Using it
 
-No UI yet (Phase C) — the acquisition engine is fully usable over the API.
-The lawful-use attestation is mandatory; a submission without `accepted: true`
-is rejected with 403 ([PLAN.md §4.7](PLAN.md#47-audit--lawful-use-attestation)):
+Open http://localhost:3000, paste links under category headers, check the
+lawful-use box (required — a submission without it is rejected with 403,
+[PLAN.md §4.7](PLAN.md#47-audit--lawful-use-attestation)), and submit. You're
+redirected to a live dashboard, then a gallery once it finishes. The share
+link (`/scrape/<token>` and `/gallery/<token>`) needs no account — it's the
+same link you'd hand to someone else, valid for 6 hours
+([PLAN.md §4.5](PLAN.md#45-storage-retention--share-links)).
+
+The whole flow is also usable directly over the API (no UI required):
 
 ```bash
 curl -X POST http://localhost:8000/api/scrapes \
@@ -96,12 +104,17 @@ curl -X POST http://localhost:8000/api/scrapes \
   }'
 # {"scrape_id": "...", "share_token": "...", "status": "queued", "links_total": 1}
 
-curl http://localhost:8000/api/scrapes/<scrape_id>       # poll status + per-item results
-curl -X POST http://localhost:8000/api/scrapes/<scrape_id>/cancel   # cooperative cancel
+curl http://localhost:8000/api/scrapes/<scrape_id>                      # owner-side status
+curl -X POST http://localhost:8000/api/scrapes/<scrape_id>/cancel       # cooperative cancel
+
+curl http://localhost:8000/api/share/<share_token>                      # public status
+curl http://localhost:8000/api/share/<share_token>/media                # list media (add
+                                                                         # ?category_id=… or ?item_id=…)
+curl -OJ http://localhost:8000/api/share/<share_token>/export           # ZIP, same query filters
 ```
 
-Media lands on disk at `/data/scrapes/<scrape_id>/<category>/`, matching the
-ZIP layout Phase C will export directly.
+Media lands on disk at `/data/scrapes/<scrape_id>/<category>/`, exactly
+matching the ZIP layout the export endpoint streams directly from.
 
 ## License
 
