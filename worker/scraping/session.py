@@ -9,7 +9,7 @@ import uuid
 from sqlalchemy.orm import Session
 
 from shared.crypto import decrypt_secret
-from shared.models import PlatformCredential
+from shared.models import PlatformCredential, Setting
 from shared.models.enums import CredentialKind
 
 _USER_AGENTS = [
@@ -27,14 +27,20 @@ class BatchSession:
     path, the same sticky proxy exit for every link in the sequential chain
     (PLAN.md §4.2's session-affinity rationale)."""
 
-    def __init__(self, scrape_id: str):
+    def __init__(self, scrape_id: str, db: Session):
         self.user_agent = random.choice(_USER_AGENTS)
         gateway = os.environ.get("PROXY_GATEWAY_URL")
+        # Admin kill-switch (PLAN.md §9 Phase 5 — Setting `proxy_enabled`,
+        # default on). Off means every Tier-2 request this batch makes goes
+        # direct through the host's own IP instead of the gateway.
+        proxy_enabled = db.query(Setting.value).filter(Setting.key == "proxy_enabled").scalar()
         # Sticky session: the gateway pins one exit per session id for the
         # batch's lifetime (§4.8), encoded as the proxy username the way
         # real rotating-proxy providers do it.
         self.proxy_url: str | None = (
-            f"http://session-{scrape_id}:@{gateway.split('://', 1)[1]}" if gateway else None
+            f"http://session-{scrape_id}:@{gateway.split('://', 1)[1]}"
+            if gateway and proxy_enabled is not False
+            else None
         )
 
 

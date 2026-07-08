@@ -4,6 +4,14 @@ via Celery Beat: past-expiry scrapes get their disk directory hard-deleted,
 their MediaFile rows removed, their share_token nulled (defense in depth —
 the read-time gate already blocks access by expires_at/status alone), and
 are marked EXPIRED.
+
+Deliberately does *not* zero total_images/total_videos/total_bytes anymore
+(a Phase C behavior, changed here in Phase 5): the disk-full predictor
+(§4.6, tasks/predictor.py) needs a "bytes_out" rate — how much data left
+the system by expiring — and the account history page reads better showing
+what a scrape *had* rather than silently zeroing it out from under the
+user. The numbers are historical from this point on; only the physical
+bytes and DB media rows are actually gone.
 """
 
 import logging
@@ -38,9 +46,6 @@ def sweep_expired() -> int:
 
             scrape.status = ScrapeStatus.EXPIRED
             scrape.share_token = None
-            scrape.total_images = 0
-            scrape.total_videos = 0
-            scrape.total_bytes = 0
             swept += 1
             logger.info("expired scrape %s (past %s)", scrape.id, scrape.expires_at)
 

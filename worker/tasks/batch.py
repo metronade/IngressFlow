@@ -197,7 +197,7 @@ def run_batch(self, scrape_id: str) -> None:
                 return
 
             scrape.status = ScrapeStatus.RUNNING
-            batch_session = scraping_session.BatchSession(scrape_id)
+            batch_session = scraping_session.BatchSession(scrape_id, db)
             scrape.proxy_used = batch_session.proxy_url is not None
             scrape.ua_used = batch_session.user_agent
 

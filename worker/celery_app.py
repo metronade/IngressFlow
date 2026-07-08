@@ -8,7 +8,7 @@ celery_app = Celery(
     "ingressflow",
     broker=REDIS_URL,
     backend=REDIS_URL,
-    include=["tasks.health", "tasks.batch", "tasks.watchdog", "tasks.retention"],
+    include=["tasks.health", "tasks.batch", "tasks.watchdog", "tasks.retention", "tasks.predictor"],
 )
 
 celery_app.conf.update(
@@ -31,6 +31,10 @@ celery_app.conf.update(
         "sweep-expired-scrapes": {
             "task": "tasks.retention.sweep_expired",
             "schedule": 60.0,
+        },
+        "sample-disk": {
+            "task": "tasks.predictor.sample_disk",
+            "schedule": 3600.0,
         },
     },
 )
