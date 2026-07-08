@@ -29,6 +29,7 @@ services:
       context: .
       dockerfile: worker/Dockerfile
     env_file: .env
+    shm_size: "1gb" # Chromium (Playwright) needs more than Docker's 64MB default /dev/shm
     volumes:
       - media:/data/scrapes
     depends_on:
@@ -38,7 +39,6 @@ services:
         condition: service_healthy
       proxy:
         condition: service_started
-    # Playwright browsers land in Phase B's image; consider shm_size: 1gb then.
 
   beat:
     build:

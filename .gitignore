@@ -20,3 +20,7 @@ out/
 
 # Docker
 data/
+
+# Operator-supplied proxy exits (real infra, not project config)
+proxy/exits.yml
+docker-compose.override.yml
