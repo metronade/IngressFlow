@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
+# Node
+node_modules/
+.next/
+out/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Editors/OS
+.DS_Store
+*.swp
+
+# Docker
+data/
