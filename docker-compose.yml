@@ -1,0 +1,95 @@
+services:
+  web:
+    build:
+      context: ./web
+    env_file: .env
+    environment:
+      - INTERNAL_API_URL=http://api:8000
+    ports: ["3000:3000"] # published for local dev without NPM in front; NPM takes over in prod
+    depends_on:
+      api:
+        condition: service_started
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    env_file: .env
+    ports: ["8000:8000"] # published for local dev without NPM in front; NPM takes over in prod
+    volumes:
+      - ./api/alembic/versions:/app/api/alembic/versions # migrations must land on the host, not the container layer
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    env_file: .env
+    volumes:
+      - media:/data/scrapes
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      proxy:
+        condition: service_started
+    # Playwright browsers land in Phase B's image; consider shm_size: 1gb then.
+
+  beat:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    env_file: .env
+    command: celery -A celery_app beat --loglevel=info
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  flower:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    env_file: .env
+    command: celery -A celery_app flower --port=5555
+    ports: ["5555:5555"] # dev only; put behind an NPM proxy host with admin auth in prod
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  proxy:
+    build:
+      context: ./proxy
+    expose: ["8888"] # internal only — never published to the host edge
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres:
+    image: postgres:16-alpine
+    env_file: .env
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  media: {}
+  redis: {}
+  pgdata: {}
