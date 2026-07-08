@@ -266,8 +266,9 @@ The **resolver** ([§4.3](#43-scraping-core--api-first-extractor-strategy)) ther
 ## 5. Data Model (core entities)
 
 ```
-User            id, email, hashed_pw, role[public|free|paid|admin], stripe_customer_id,
-                credit_balance, created_at
+User            id, email, hashed_pw, is_active, is_superuser, is_verified (fastapi-users'
+                structural requirements, added Phase 4), role[public|free|paid|admin],
+                stripe_customer_id, credit_balance, created_at
 Scrape          id, user_id (nullable for public), status, config(jsonb: video_only/…),
                 share_token, total_images, total_videos, total_bytes,
                 created_at, expires_at, proxy_used, ua_used
@@ -312,25 +313,35 @@ IngressFlow/
 │   ├── Dockerfile
 │   ├── app/
 │   │   ├── page.tsx              # input form: textarea + config toggles + attestation checkbox
+│   │   ├── login/, register/     # auth forms; register auto-logs in (no mailer, no verify step)
+│   │   ├── account/              # profile, tier, "Upgrade to Paid", scrape history
 │   │   ├── scrape/[token]/       # live dashboard: WS-driven stats, per-item status, cancel
 │   │   └── gallery/[token]/      # ALL/category/single-link scopes, multiselect, lightbox
+│   ├── components/NavBar.tsx     # login state, tier badge
 │   ├── lib/ws.ts                 # useShareSocket: WS client, exponential-backoff reconnect,
 │   │                             # treats close code 4410 (expired) as terminal, not retryable
-│   └── lib/api.ts                # fetch helpers for /api/scrapes and /api/share/*
+│   ├── lib/auth.tsx              # AuthProvider/useAuth — fetches /users/me whenever a token exists
+│   ├── lib/token.ts               # localStorage JWT (no framework deps — avoids an auth.tsx <-> api.ts cycle)
+│   ├── lib/authErrors.ts         # maps fastapi-users' machine codes (LOGIN_BAD_CREDENTIALS, …) to text
+│   └── lib/api.ts                # fetch helpers for /api/scrapes, /api/share/*, /api/auth/*, /api/billing/*
 ├── api/                         # FastAPI
 │   ├── Dockerfile
 │   ├── app/
 │   │   ├── main.py
-│   │   ├── api/routes/          # health, scrapes (submit/status/cancel), share (status,
-│   │   │                        # categories, media list/file, export); auth, admin, billing,
-│   │   │                        # cms, takedown land in later phases
+│   │   ├── api/routes/          # health, scrapes (submit/status/cancel/history), share (status,
+│   │   │                        # categories, media list/file, export), billing (checkout/webhook);
+│   │   │                        # fastapi-users supplies auth/jwt, auth/register, auth/verify,
+│   │   │                        # auth/reset-password, users/me — admin/cms/takedown land later
 │   │   ├── ws/                  # health echo + share.py — the real progress hub (§4.4):
 │   │   │                        # initial snapshot on connect, then forwards Redis Pub/Sub
 │   │   │                        # (progress/done) until the client disconnects
-│   │   ├── schemas/              # Pydantic v2 (scrape submit/status, share status/media/export)
+│   │   ├── schemas/              # Pydantic v2 (scrape submit/status/history, share status/media/
+│   │   │                         # export, user read/create/update)
 │   │   ├── services/             # audit.py, tasks.py (enqueue/cancel), expiry.py (410 gate —
-│   │   │                         # shared by every share route), export.py (streamed ZIP)
-│   │   ├── core/                 # config, security, deps
+│   │   │                         # shared by every share route), export.py (streamed ZIP),
+│   │   │                         # limits.py (tier resolution + Redis rate-limit counters)
+│   │   ├── core/                 # config, users.py (fastapi-users wiring: UserManager, JWT
+│   │   │                         # backend, current_active_user[_optional]), deps
 │   │   └── db/                   # async session (asyncpg) + alembic env
 │   └── alembic/
 ├── worker/                      # Celery
@@ -496,11 +507,22 @@ Each phase ends with something demonstrable. Rough sizing assumes a small team; 
 
 **Bug found and fixed by this testing, not by inspection:** the `api` service was never given access to the `media` volume in `docker-compose.yml` — Phase A/B never needed it, since only the worker wrote files. Every share/gallery/export read failed with `FileNotFoundError` until this was added (§7's blueprint already *described* both services sharing the volume — it just hadn't been wired into the real compose file yet).
 
-### Phase 4 — Users, tiers & monetization
+### Phase 4 — Users, tiers & monetization — ✅ done
 - `fastapi-users` auth (register/verify/reset); roles.
 - **Public tier**: no account; each scrape yields a dynamic share link to the *full* gallery/export (same library as paid). Gated **only** by max-URLs-per-scrape and max-scrapes-per-IP-per-24h (Redis counters keyed by IP). Registered free/paid tiers add persistent history + higher limits.
 - Stripe scaffolding (Checkout, webhooks, credit/subscription framework) — products can stay in test mode.
 - **Exit:** an anonymous visitor scrapes within IP limits and gets a working share-linked gallery; a registered/paid account raises the limits and keeps history.
+
+**Implementation notes:**
+- `User` (shared/models/user.py) gained `is_active`/`is_superuser`/`is_verified` and a widened `hashed_password` column — the structural shape fastapi-users' `SQLAlchemyUserDatabase` needs. It does **not** inherit fastapi-users' own base table class; verified against fastapi-users 15.0.5 that the adapter is generic over any model with matching attribute names, not an isinstance check, so `User` stays a plain member of our own `Base`/`UUIDPk`/`TimestampMixin` hierarchy.
+- **No mailer wired in v1** (same "built but inactive" pattern as Tier-1 platform APIs, §12): verification and password-reset tokens are logged, not emailed. Consequently the frontend logs a user straight in after registration instead of the usual "check your email" step — there's no working email loop yet for them to complete. `is_verified` stays `False` for everyone; no route currently gates on it.
+- JWT sessions last 7 days (no refresh-token flow in v1) — a deliberate simplification given the added complexity of refresh rotation wasn't worth it before Phase F's hardening pass.
+- **Tier limits** (`api/app/services/limits.py`), hardcoded fallbacks until Phase E's admin UI can override them via `Setting` rows (`limits.<role>.<field>`): public 25 links/scrape, 10 scrapes/IP/24h; free 50 links/scrape, 20 scrapes/day; paid/admin the full 100-link architectural ceiling, no period cap. A rejected submission (bad attestation, too many links) never burns part of the caller's quota — the rate-limit counter only increments after those checks pass.
+- **Stripe**: Checkout session creation and the webhook handler (`checkout.session.completed` → paid, `customer.subscription.deleted`/`updated` → free on cancellation) are both real code, gated by `STRIPE_SECRET_KEY`/`STRIPE_WEBHOOK_SECRET` — undefined in this dev environment, so both routes return 503 rather than crash (§12's "wired but inactive" pattern again). The **webhook handler's logic** was verified for real by constructing locally-HMAC-signed test events (Stripe's signature scheme needs no live account to test) and confirming a user actually flips PAID→FREE in the DB, plus that a bad signature is correctly rejected with 400. The **Checkout-session-creation call itself** was not exercised against Stripe's real API — no live keys exist — so that specific path is unverified beyond "returns 503 when unconfigured."
+- **Bug found by this testing:** newer `stripe` (15.3.0) returns `event["data"]["object"]` as a `StripeObject`, not a plain dict — `.get()` raises `AttributeError` rather than returning `None`. Fixed by switching to `getattr(data, field, None)`.
+- **Bug found and fixed, pre-existing since Phase C:** `ScrapeStatusResponse.share_token` was typed as a non-nullable `str`, but `Scrape.share_token` became nullable back in Phase C (the retention sweep nulls it). Any expired scrape queried via `GET /api/scrapes/{id}` would have failed Pydantic response validation with a 500. Found while adding the history schema, fixed to `str | None`.
+
+**Verified via a real Playwright browser:** register → auto-login → empty history on `/account`; log out → submit anonymously (public tier) → succeeds; log back in → wrong password shows a friendly "Incorrect email or password." (not the raw `LOGIN_BAD_CREDENTIALS` code fastapi-users returns) → correct password succeeds; submit while authenticated → the scrape is attributed to the user and appears in `/account`'s history with working Dashboard/Gallery links. Tier differentiation confirmed directly against the API: 30 links rejected for an anonymous submitter (max 25) but accepted for a free-tier account (max 50); the 24h rate limit confirmed by temporarily overriding `limits.public.max_scrapes_per_period` down to 1 via a `Setting` row and observing the second anonymous submission get 429.
 
 ### Phase 5 — Admin dashboard
 - Live IO/CPU/disk (host metrics); Flower behind admin auth.
@@ -589,3 +611,6 @@ If you want stronger anti-competition protection and can accept **"source-availa
 2. **Attestation wording**: the exact legal text of the lawful-use checkbox needs counsel sign-off (versioned in `LawfulAttestation.text_version`).
 3. **Upstream proxy exits**: what exit nodes the operator attaches to the gateway (LTE modems / home endpoints / SOCKS/VPN) — determines the real "residential" quality ([§4.8](#48-self-hosted-proxy-gateway-decided--no-commercial-providers)); pure single-host = host/datacenter IP.
 4. **shadcn/ui**: Phase C shipped the frontend with plain Tailwind (no shadcn/ui components) to keep scope on functional correctness — every page/interaction was verified with a real Playwright browser instead. Adopting shadcn/ui for visual polish is still open and can happen incrementally, component by component, without touching the data-fetching/WS logic.
+5. **Mailer**: Phase 4 shipped auth with no SMTP wired — verification/reset tokens are logged, not emailed, and the frontend auto-logs a user in after registration rather than making them complete a verification step that has nowhere to send its email yet. Wiring a real transactional-email provider (and then actually gating login on `is_verified`) is Phase F territory.
+6. **JWT refresh**: v1 uses a single 7-day access token with no refresh-token rotation — simplest thing that works; revisit if session length or revocation-on-demand becomes a real requirement.
+7. **Stripe**: no live account/keys exist for this project yet. The webhook handler's event-processing logic is verified (locally-signed test events); Checkout-session creation is real code but has never been exercised against Stripe's actual API. Needs a real test-mode Stripe account + `STRIPE_SECRET_KEY`/`STRIPE_WEBHOOK_SECRET`/`STRIPE_PRICE_ID` before launch.

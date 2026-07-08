@@ -9,14 +9,14 @@ Full architecture, phased delivery plan, and license rationale: **[PLAN.md](PLAN
 
 ## Status
 
-**Phase C — Dashboard + gallery: done.** There's a real UI now: paste links,
-watch them scrape live over a WebSocket, get a browser notification on
-completion, then browse the results in a gallery (all / by category / by
-single link), multi-select a download, or export a filtered view as a ZIP.
-Retention is enforced two ways — a background sweep that hard-deletes
-expired data, and a read-time gate that returns 410/closes the socket the
-instant a link expires, even before the sweep runs. Verified with a real
-Playwright browser clicking through the actual UI, not just curl.
+**Phase D — Accounts, tiers & monetization: done.** Registration, JWT login,
+and per-tier limits are real: anonymous visitors get the same gallery/export
+as everyone else, capped by links-per-scrape and scrapes-per-IP-per-24h;
+registered accounts get higher caps, persistent history at `/account`, and
+an upgrade path to Stripe Checkout. No live Stripe account exists yet, so
+billing is verified as far as it can be without one — see
+[PLAN.md's Phase 4 notes](PLAN.md#9-phased-delivery-plan) for exactly what
+that does and doesn't cover.
 
 Delivery phases (see [PLAN.md §9](PLAN.md#9-phased-delivery-plan) for detail):
 
@@ -25,8 +25,8 @@ Delivery phases (see [PLAN.md §9](PLAN.md#9-phased-delivery-plan) for detail):
 | A | Foundations & data model | ✅ done |
 | B | Acquisition engine (parser, worker queue, proxy gateway, lawful-use gate) | ✅ done |
 | C | Dashboard + gallery (realtime WS, storage, retention, export) | ✅ done |
-| D | Accounts, tiers & monetization | next |
-| E | Admin & observability | planned |
+| D | Accounts, tiers & monetization | ✅ done |
+| E | Admin & observability | next |
 | F | Hardening & launch | planned |
 
 ## Architecture at a glance
@@ -41,10 +41,10 @@ Delivery phases (see [PLAN.md §9](PLAN.md#9-phased-delivery-plan) for detail):
 ## Repository layout
 
 ```
-api/        FastAPI service — scrape submit/status/cancel, share (status/media/export), WS hub
+api/        FastAPI — scrapes, share, billing routes; fastapi-users auth; WS hub; tier limits
 worker/     Celery worker + beat (run_batch, crash-recovery watchdog, retention sweep, cascade)
 proxy/      Self-hosted rotating proxy gateway (real: CONNECT/HTTP, SOCKS5 exits, sticky sessions)
-web/        Next.js frontend — input form, live dashboard, gallery (plain Tailwind, no shadcn/ui yet)
+web/        Next.js — input form, live dashboard, gallery, login/register/account (plain Tailwind)
 shared/     Models, parser, credential encryption, disk-layout helpers — single source of truth
 docs/       Deployment/architecture reference docs
 PLAN.md     Architecture & phased delivery plan
@@ -90,7 +90,15 @@ lawful-use box (required — a submission without it is rejected with 403,
 redirected to a live dashboard, then a gallery once it finishes. The share
 link (`/scrape/<token>` and `/gallery/<token>`) needs no account — it's the
 same link you'd hand to someone else, valid for 6 hours
-([PLAN.md §4.5](PLAN.md#45-storage-retention--share-links)).
+([PLAN.md §4.5](PLAN.md#45-storage-retention--share-links)). That works
+anonymously (public tier: 25 links/scrape, 10 scrapes per IP per 24h by
+default).
+
+Register at `/register` for a free account (50 links/scrape, 20 scrapes/day)
+and a persistent history at `/account`, or upgrade to paid from there for
+the full 100-link batch size and no daily cap. There's no email step in v1
+(no mailer wired yet — see [PLAN.md §12](PLAN.md#12-open-decisions)), so
+registering logs you straight in.
 
 The whole flow is also usable directly over the API (no UI required):
 
@@ -111,6 +119,15 @@ curl http://localhost:8000/api/share/<share_token>                      # public
 curl http://localhost:8000/api/share/<share_token>/media                # list media (add
                                                                          # ?category_id=… or ?item_id=…)
 curl -OJ http://localhost:8000/api/share/<share_token>/export           # ZIP, same query filters
+
+# auth (fastapi-users) — attach the bearer token to /api/scrapes and
+# /api/me/scrapes to submit/list as that account instead of anonymously
+curl -X POST http://localhost:8000/api/auth/register \
+  -H "Content-Type: application/json" -d '{"email":"you@example.com","password":"..."}'
+curl -X POST http://localhost:8000/api/auth/jwt/login \
+  -H "Content-Type: application/x-www-form-urlencoded" -d "username=you@example.com&password=..."
+# {"access_token": "...", "token_type": "bearer"}
+curl http://localhost:8000/api/me/scrapes -H "Authorization: Bearer <access_token>"
 ```
 
 Media lands on disk at `/data/scrapes/<scrape_id>/<category>/`, exactly
