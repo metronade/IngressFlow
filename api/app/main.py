@@ -1,7 +1,9 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.routes.admin import router as admin_router
 from app.api.routes.billing import router as billing_router
+from app.api.routes.cms import router as cms_router
 from app.api.routes.health import router as health_router
 from app.api.routes.scrapes import router as scrapes_router
 from app.api.routes.share import router as share_router
@@ -25,6 +27,8 @@ app.include_router(health_router, prefix="/api")
 app.include_router(scrapes_router, prefix="/api")
 app.include_router(share_router, prefix="/api")
 app.include_router(billing_router, prefix="/api")
+app.include_router(admin_router, prefix="/api")
+app.include_router(cms_router, prefix="/api")
 app.include_router(ws_health_router)
 app.include_router(ws_share_router)
 
