@@ -3,7 +3,9 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routes.health import router as health_router
 from app.api.routes.scrapes import router as scrapes_router
+from app.api.routes.share import router as share_router
 from app.ws.health import router as ws_health_router
+from app.ws.share import router as ws_share_router
 
 app = FastAPI(title="IngressFlow API")
 
@@ -18,4 +20,6 @@ app.add_middleware(
 
 app.include_router(health_router, prefix="/api")
 app.include_router(scrapes_router, prefix="/api")
+app.include_router(share_router, prefix="/api")
 app.include_router(ws_health_router)
+app.include_router(ws_share_router)
