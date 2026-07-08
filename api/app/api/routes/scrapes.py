@@ -16,6 +16,7 @@ from app.schemas.scrape import (
 )
 from app.services.audit import write_audit
 from app.services.limits import enforce_rate_limit, resolve_limits
+from app.services.settings import get_setting
 from app.services.tasks import enqueue_run_batch, request_cancel
 from shared.models import Category, LawfulAttestation, Scrape, ScrapeItem, UsageEvent, User
 from shared.models.enums import ScrapeStatus
@@ -66,13 +67,14 @@ async def submit_scrape(
     await enforce_rate_limit(user, ip, limits)
 
     now = datetime.now(timezone.utc)
+    retention_hours = await get_setting(db, "retention_hours", DEFAULT_RETENTION_HOURS)
 
     scrape = Scrape(
         user_id=user.id if user is not None else None,
         status=ScrapeStatus.QUEUED,
         config=payload.config.model_dump(),
         share_token=secrets.token_urlsafe(32),
-        expires_at=now + timedelta(hours=DEFAULT_RETENTION_HOURS),
+        expires_at=now + timedelta(hours=retention_hours),
     )
     db.add(scrape)
     await db.flush()
