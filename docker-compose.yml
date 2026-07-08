@@ -67,7 +67,10 @@ services:
       context: .
       dockerfile: worker/Dockerfile
     env_file: .env
-    command: celery -A celery_app flower --port=5555
+    # FLOWER_BASIC_AUTH is "user:pass" (PLAN.md §9 Phase 5 — "Flower behind
+    # admin auth"); this is on top of, not instead of, keeping it off the
+    # public NPM edge entirely in prod.
+    command: sh -c 'celery -A celery_app flower --port=5555 --basic_auth=$$FLOWER_BASIC_AUTH'
     ports: ["5555:5555"] # dev only; put behind an NPM proxy host with admin auth in prod
     depends_on:
       redis:
