@@ -270,10 +270,10 @@ User            id, email, hashed_pw, role[public|free|paid|admin], stripe_custo
                 credit_balance, created_at
 Scrape          id, user_id (nullable for public), status, config(jsonb: video_only/…),
                 share_token, total_images, total_videos, total_bytes,
-                created_at, expires_at, proxy_used, ua_used, attestation_id
+                created_at, expires_at, proxy_used, ua_used
 Category        id, scrape_id, name (e.g. "L1234"), order
-ScrapeItem      id, scrape_id, category_id, url, platform, status, images_found, images_ok,
-                videos_found, videos_ok, error, started_at, finished_at
+ScrapeItem      id, scrape_id, category_id, sequence, url, platform, status, images_found,
+                images_ok, videos_found, videos_ok, error, started_at, finished_at
 MediaFile       id, item_id, category_id, type[image|video], path, bytes, width, height,
                 duration, source_url, source_method[api|ytdlp|gallerydl|playwright],
                 checksum (dedup), metadata_json
@@ -292,8 +292,9 @@ DiskSample      id, ts, free_bytes, bytes_in_rate, bytes_out_rate, hours_to_full
 
 Notes:
 - `PlatformCredential.secret_blob` (Tier-1 API keys, Tier-2 OAuth tokens/cookies) is **encrypted at rest** ([§10](#10-legal--compliance-risk)); never exposed to non-admin users or in API responses. This replaces the earlier `AdminCookie` table and covers both API and scrape-fallback credentials.
-- `LawfulAttestation` is required for every `Scrape`; a batch with `accepted = false`/absent is rejected at submit ([§4.7](#47-audit--lawful-use-attestation)).
+- `LawfulAttestation` is required for every `Scrape`; a batch with `accepted = false`/absent is rejected at submit ([§4.7](#47-audit--lawful-use-attestation)). **Implementation note (deviation from the schema first sketched here):** rather than a circular `Scrape.attestation_id` ↔ `LawfulAttestation.scrape_id` FK pair, `LawfulAttestation.scrape_id` (unique) is the sole, authoritative FK; `Scrape.attestation` is just the read-side of that relationship. Avoids a same-migration circular dependency for no added value.
 - `AuditLog` is **append-only** (no app-level update/delete) and outlives the 6h media window.
+- `ScrapeItem.sequence` (added during Phase B implementation, not in the original sketch): UUID primary keys don't sort in submission order, and `run_batch` must process a batch's links in exactly the order pasted — `sequence` is the stable, gapless ordering key assigned at parse time.
 
 ---
 
@@ -318,31 +319,44 @@ IngressFlow/
 │   ├── Dockerfile
 │   ├── app/
 │   │   ├── main.py
-│   │   ├── api/routes/          # scrapes, auth, gallery, admin, billing, cms, share, audit, takedown
-│   │   ├── ws/                  # connection hub + Redis Pub/Sub subscriber
-│   │   ├── models/              # SQLAlchemy
-│   │   ├── schemas/             # Pydantic v2
-│   │   ├── services/            # parsing, limits, storage iface, billing, audit, attestation
-│   │   ├── core/                # config, security, deps
-│   │   └── db/                  # session, alembic env
+│   │   ├── api/routes/          # health, scrapes (submit/status/cancel); auth, gallery, admin,
+│   │   │                        # billing, cms, share, takedown land in later phases
+│   │   ├── ws/                  # connection hub + Redis Pub/Sub subscriber (health echo in v1;
+│   │   │                        # real progress hub is Phase C, §4.4)
+│   │   ├── schemas/              # Pydantic v2 (ScrapeSubmitRequest/Response, …)
+│   │   ├── services/             # audit.py (append-only AuditLog writes), tasks.py (Celery
+│   │   │                         # client: enqueue_run_batch, request_cancel)
+│   │   ├── core/                 # config, security, deps
+│   │   └── db/                   # async session (asyncpg) + alembic env
 │   └── alembic/
-├── worker/                      # Celery (shares api models via installed package or shared dir)
+├── worker/                      # Celery
 │   ├── Dockerfile
-│   ├── celery_app.py
+│   ├── celery_app.py             # broker/backend, beat_schedule, visibility_timeout (see below)
+│   ├── db.py                     # sync SQLAlchemy session (psycopg) — Celery tasks stay sync
+│   ├── storage.py                # disk layout, checksum dedup (hardlink), category sanitization
 │   ├── tasks/
-│   │   ├── batch.py             # run_batch (§4.2)
-│   │   ├── retention.py         # 6h sweep (§4.5)
-│   │   └── predictor.py         # disk forecast (§4.6)
+│   │   ├── batch.py              # run_batch (§4.2)
+│   │   ├── watchdog.py           # requeues a batch whose worker died mid-run — the actual
+│   │   │                         # fast-recovery path; see the crash-resilience note below
+│   │   ├── retention.py          # 6h sweep (§4.5) — Phase C
+│   │   └── predictor.py          # disk forecast (§4.6) — Phase E
 │   └── scraping/
-│       ├── extractors/          # api/ (per-platform Tier-1), ytdlp.py, gallerydl.py, playwright.py
-│       ├── resolver.py          # url → platform; picks tier (API vs scrape) AND egress (direct vs proxy)
-│       ├── session.py           # UA rotation, ProxyBackend client, cookie injection
-│       └── parser.py            # category-header text parsing
+│       ├── resolver.py           # url → platform; picks tier (API vs scrape) AND egress
+│       ├── session.py            # per-batch UA + sticky proxy URL, cookie lookup/decrypt
+│       └── extractors/
+│           ├── cascade.py        # yt-dlp → gallery-dl → Playwright, first success wins
+│           ├── ytdlp.py, gallerydl.py, playwright_extractor.py
+│           └── api_stub.py       # Tier-1 extraction point — built, deliberately inactive (§12)
 ├── proxy/                       # self-hosted rotating proxy gateway (§4.8)
 │   ├── Dockerfile
-│   ├── gateway.py               # rotation, per-batch IP affinity, health-check/eviction
-│   └── exits.example.yml        # operator-supplied upstream exit nodes (LTE/SOCKS/VPN)
-├── shared/                      # models/schemas shared by api + worker (single source of truth)
+│   ├── gateway.py                # asyncio HTTP/CONNECT proxy; SOCKS5 upstream exits; sticky
+│   │                             # sessions via Proxy-Authorization; health-check/eviction; /stats
+│   └── exits.example.yml         # operator-supplied upstream exit nodes (empty by default)
+├── shared/                      # single source of truth for api + worker
+│   ├── models/                   # SQLAlchemy (all 12 entities, §5)
+│   ├── parsing.py                # category-header text parser — lives here, not under
+│   │                             # worker/scraping/, since the API needs it at submit time
+│   └── crypto.py                 # Fernet encrypt/decrypt for PlatformCredential.secret_blob
 └── docs/
     ├── ARCHITECTURE.md
     ├── DEPLOYMENT.md
@@ -350,6 +364,8 @@ IngressFlow/
     ├── npm-proxy-hosts.md       # NPM edge config (TLS + routing)
     └── COMPLIANCE.md            # GDPR / ToS / takedown process
 ```
+
+**Crash resilience, completed (Phase B):** per-item checkpointing to Postgres (already in the §4.2 sketch) only prevents *data loss* when a worker dies — Celery's Redis broker only redelivers an orphaned message after `visibility_timeout`, which is deliberately set *longer* than the longest legitimate batch (100 links' worst-case jitter + download time) to avoid the opposite failure of two workers processing the same batch at once. Left there, recovery from a killed worker could take hours. `tasks.watchdog.requeue_stuck_batches` (Celery Beat, every 60s) closes that gap: it finds scrapes stuck `RUNNING` with no item progress for 5+ minutes and re-enqueues `run_batch` for them — safe to do because `_process_one` already skips any item in a terminal state, so this only ever resumes. Verified by killing the worker mid-batch (SIGKILL) and confirming the watchdog resumed the remaining items with no duplicate processing.
 
 ---
 
@@ -380,7 +396,7 @@ services:
       - PROXY_GATEWAY_URL=http://proxy:8888   # Tier-2 scrape traffic routed here; APIs go direct
     volumes: ["media:/data/scrapes"]
     depends_on: [redis, postgres, proxy]
-    # Playwright browsers baked into the image; consider shm_size: 1gb
+    shm_size: "1gb"                        # Chromium (Playwright) needs more than Docker's 64MB default
 
   proxy:                                       # self-hosted rotating gateway (§4.8)
     build: ./proxy
@@ -441,13 +457,16 @@ Each phase ends with something demonstrable. Rough sizing assumes a small team; 
 - Health checks + a "hello" round trip: web → api → db → redis.
 - **Exit:** `docker compose up` yields a reachable frontend and a green `/api/health`.
 
-### Phase 1 — Acquisition engine (headless, no UI polish)
+### Phase 1 — Acquisition engine (headless, no UI polish) — ✅ done
+
 - Category-header **text parser** (`L1234` grouping); URL → platform **resolver**.
 - `run_batch` task ([§4.2](#42-the-worker-queue-the-core-design)): sequential loop, jitter delays, UA rotation, per-item checkpointing, cancellation, resume-on-crash.
 - **Tiering built, but API ships inactive** ([§4.3](#43-scraping-core--api-first-extractor-strategy)): the resolver + `ProxyBackend` + Tier-1/Tier-2 dispatch are all in place, but **v1 launches scrape-only for testing** — no API credentials configured, so every URL takes the Tier-2 path. Tier-1 activates later per platform purely by adding credentials in admin, **no redeploy**. Record `source_method` per item; config toggles; media to `/data/scrapes/...`.
 - **Self-hosted proxy gateway** ([§4.8](#48-self-hosted-proxy-gateway-decided--no-commercial-providers)): `proxy` service + `ProxyBackend` client; Tier-2 traffic routed through it with per-batch exit-IP affinity; runnable with zero exits (direct/host IP) and with operator-attached exits.
 - **Attestation gate + audit log** ([§4.7](#47-audit--lawful-use-attestation)): submit rejected without accepted attestation; every scrape start written to append-only `AuditLog`. (Build the enforcement here, at the API boundary, so no path can bypass it.)
 - **Exit:** a batch with a valid attestation runs **scrape-only** across 10 concurrent slots through the proxy gateway; a batch *without* attestation is rejected; audit rows recorded; media on disk in ZIP-ready layout. (Flipping on a Tier-1 API credential later must reroute that platform to the API with no code change.)
+
+**Verified via Docker (real content, not mocks):** yt-dlp fetched a real YouTube video at full quality (4K confirmed on one run); gallery-dl fetched a real direct image; the yt-dlp → gallery-dl cascade required excluding yt-dlp's own generic extractor (it otherwise claims *any* URL is "supported" and then fails instead of deferring — see `ytdlp.py`); checksum dedup correctly hard-linked a repeated URL across two categories instead of storing it twice; the attestation gate rejected an unchecked submission (403) and the 100-link cap rejected an oversized batch (422); cancellation stopped a batch mid-chain leaving the rest `PENDING`; a `SIGKILL`'d worker's batch was correctly picked back up by `tasks.watchdog.requeue_stuck_batches` with no duplicate processing; the proxy gateway was verified both in direct-passthrough mode and — using a throwaway test SOCKS5 container — with a real upstream exit, confirming session-to-exit pinning and CONNECT tunneling both work.
 
 ### Phase 2 — Realtime dashboard
 - Redis Pub/Sub → FastAPI WS hub → browser ([§4.4](#44-realtime-pipeline-websockets)).

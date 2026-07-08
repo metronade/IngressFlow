@@ -9,16 +9,20 @@ Full architecture, phased delivery plan, and license rationale: **[PLAN.md](PLAN
 
 ## Status
 
-**Phase A — Foundations: done.** Repo scaffold, full database schema, and a
-verified health round trip across every service.
+**Phase B — Acquisition engine: done.** A scrape batch runs end to end —
+parsed, gated behind a mandatory lawful-use attestation, processed
+sequentially through a real yt-dlp → gallery-dl → Playwright cascade behind
+a self-hosted rotating proxy gateway, checkpointed to Postgres with
+checksum dedup, audit-logged, cancellable, and resumable if the worker
+crashes mid-batch. All verified against real content via Docker, not mocks.
 
 Delivery phases (see [PLAN.md §9](PLAN.md#9-phased-delivery-plan) for detail):
 
 | Phase | Scope | Status |
 |---|---|---|
 | A | Foundations & data model | ✅ done |
-| B | Acquisition engine (parser, worker queue, proxy gateway, lawful-use gate) | next |
-| C | Dashboard + gallery (realtime WS, storage, retention, export) | planned |
+| B | Acquisition engine (parser, worker queue, proxy gateway, lawful-use gate) | ✅ done |
+| C | Dashboard + gallery (realtime WS, storage, retention, export) | next |
 | D | Accounts, tiers & monetization | planned |
 | E | Admin & observability | planned |
 | F | Hardening & launch | planned |
@@ -35,11 +39,11 @@ Delivery phases (see [PLAN.md §9](PLAN.md#9-phased-delivery-plan) for detail):
 ## Repository layout
 
 ```
-api/        FastAPI service (REST, WebSocket, Alembic migrations)
-worker/     Celery worker + beat (scraping tasks, retention sweep, disk predictor)
-proxy/      Self-hosted rotating proxy gateway (stub in Phase A; real logic in Phase B)
+api/        FastAPI service (REST, WebSocket, Alembic migrations, scrape submit/status/cancel)
+worker/     Celery worker + beat (run_batch, crash-recovery watchdog, scraping cascade)
+proxy/      Self-hosted rotating proxy gateway (real: CONNECT/HTTP, SOCKS5 exits, sticky sessions)
 web/        Next.js frontend
-shared/     SQLAlchemy models — single source of truth for api + worker
+shared/     Models, category-header parser, credential encryption — single source of truth
 docs/       Deployment/architecture reference docs
 PLAN.md     Architecture & phased delivery plan
 ```
@@ -75,6 +79,29 @@ curl http://localhost:8000/api/health
 In production, none of these ports are published to the host — Nginx Proxy
 Manager sits in front and is the only public entrypoint (see
 [docs/npm-proxy-hosts.md](docs/npm-proxy-hosts.md)).
+
+## Submitting a scrape
+
+No UI yet (Phase C) — the acquisition engine is fully usable over the API.
+The lawful-use attestation is mandatory; a submission without `accepted: true`
+is rejected with 403 ([PLAN.md §4.7](PLAN.md#47-audit--lawful-use-attestation)):
+
+```bash
+curl -X POST http://localhost:8000/api/scrapes \
+  -H "Content-Type: application/json" \
+  -d '{
+    "raw_text": "L1234\nhttps://www.youtube.com/watch?v=jNQXAC9IVRw",
+    "config": {"include_metadata": true},
+    "attestation": {"accepted": true, "text_version": "v1"}
+  }'
+# {"scrape_id": "...", "share_token": "...", "status": "queued", "links_total": 1}
+
+curl http://localhost:8000/api/scrapes/<scrape_id>       # poll status + per-item results
+curl -X POST http://localhost:8000/api/scrapes/<scrape_id>/cancel   # cooperative cancel
+```
+
+Media lands on disk at `/data/scrapes/<scrape_id>/<category>/`, matching the
+ZIP layout Phase C will export directly.
 
 ## License
 
