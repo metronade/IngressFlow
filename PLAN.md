@@ -163,13 +163,20 @@ Sketch:
 def run_batch(self, scrape_id: str):
     scrape = load_scrape(scrape_id)
     mark_running(scrape)
-    session = build_session(scrape)          # UA, proxy IP, cookies — held for whole batch
+    exit_ip = acquire_proxy_exit(scrape)     # one exit pinned for the batch — Tier-2 only
 
     for item in pending_items(scrape):       # resumable: only PENDING/SCRAPING
         if is_cancelled(scrape_id):          # cooperative cancel (Redis flag)
             mark_cancelled(scrape); break
-        jitter_sleep(1.8, 4.2)               # human mimicry
-        result = extract(item.url, session, scrape.config)   # yt-dlp/gallery-dl/Playwright
+
+        route = resolver.route(item.url)     # per URL: (tier, egress)
+        if route.tier == "api":              # Tier-1: DIRECT egress, no proxy, no jitter
+            result = extract_api(item.url, scrape.config)
+        else:                                # Tier-2: proxy egress + human mimicry
+            jitter_sleep(1.8, 4.2)
+            session = build_session(scrape, exit_ip=exit_ip)   # UA, proxy exit, cookies
+            result = extract_scrape(item.url, session, scrape.config)  # yt-dlp/gallery-dl/Playwright
+
         persist_item_result(item, result)    # checkpoint to Postgres + write media to disk
         publish_progress(scrape_id, snapshot(scrape))        # Redis Pub/Sub → WS
 
@@ -237,7 +244,16 @@ Together these answer "who started which scrape, under what asserted rights" —
 
 **Decision:** ship our **own Docker-based rotating proxy gateway** as a stack service. Bright Data / Oxylabs are dropped for now; no per-GB billing to a third party. The `ProxyBackend` interface stays generic so a commercial provider *could* be plugged in later, but v1 is self-hosted only.
 
-**What it is:** a `proxy` container — a rotating forward-proxy gateway (HTTP/SOCKS) that sits between the workers and the internet. Workers on the **Tier-2 scrape path** route outbound requests through it (Tier-1 API calls go direct — APIs don't need proxying). Responsibilities:
+**Egress routing depends on scrape type — this is a hard rule, not an optimization:**
+
+| Path | Egress | Why |
+|---|---|---|
+| **Tier-1 official API** | **Direct** (out the host, never the proxy) | The call is already authenticated & ToS-compliant, so there's no IP-block to dodge. Worse, routing an authenticated API token through *rotating residential exits* makes the account's requests come from constantly-changing IPs — a classic fraud/abuse signal that gets **API keys flagged or banned**. Proxying here adds risk and latency for zero benefit. |
+| **Tier-2 scrape** | **Through the proxy gateway** | Unauthenticated/anti-bot-guarded fetches that *do* need IP rotation + per-batch affinity to avoid blocks. |
+
+The **resolver** ([§4.3](#43-scraping-core--api-first-extractor-strategy)) therefore decides two things per URL together: *which extractor tier* and *which egress*. `build_session` in `run_batch` only attaches a proxy exit when the chosen path is Tier-2; a Tier-1 item runs on a direct connection with no exit assigned (`exit_ip = null` on its `UsageEvent`).
+
+**What it is:** a `proxy` container — a rotating forward-proxy gateway (HTTP/SOCKS) that sits between the workers and the internet, **on the Tier-2 path only**. Responsibilities:
 - **Exit-IP pool + rotation:** rotate among a configurable set of upstream exit endpoints.
 - **Per-batch session affinity:** pin one exit IP for the lifetime of a batch (matches the anti-block model in [§4.2](#42-the-worker-queue-the-core-design) — one IP per sequential chain), rotate *across* batches.
 - **Health checks + eviction** of dead/blocked exits, so a burned IP is dropped from rotation.
@@ -319,7 +335,7 @@ IngressFlow/
 │   │   └── predictor.py         # disk forecast (§4.6)
 │   └── scraping/
 │       ├── extractors/          # api/ (per-platform Tier-1), ytdlp.py, gallerydl.py, playwright.py
-│       ├── resolver.py          # url → platform; picks Tier-1 API vs Tier-2 fallback
+│       ├── resolver.py          # url → platform; picks tier (API vs scrape) AND egress (direct vs proxy)
 │       ├── session.py           # UA rotation, ProxyBackend client, cookie injection
 │       └── parser.py            # category-header text parsing
 ├── proxy/                       # self-hosted rotating proxy gateway (§4.8)
