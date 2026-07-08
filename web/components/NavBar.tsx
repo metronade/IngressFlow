@@ -20,6 +20,11 @@ export function NavBar() {
             <Link href="/account" className="text-neutral-300 hover:text-white">
               Account
             </Link>
+            {user.is_superuser && (
+              <Link href="/admin" className="text-neutral-300 hover:text-white">
+                Admin
+              </Link>
+            )}
             <button onClick={logout} className="text-neutral-300 hover:text-white">
               Log out
             </button>
