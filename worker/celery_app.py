@@ -8,7 +8,7 @@ celery_app = Celery(
     "ingressflow",
     broker=REDIS_URL,
     backend=REDIS_URL,
-    include=["tasks.health", "tasks.batch", "tasks.watchdog"],
+    include=["tasks.health", "tasks.batch", "tasks.watchdog", "tasks.retention"],
 )
 
 celery_app.conf.update(
@@ -26,6 +26,10 @@ celery_app.conf.update(
     beat_schedule={
         "requeue-stuck-batches": {
             "task": "tasks.watchdog.requeue_stuck_batches",
+            "schedule": 60.0,
+        },
+        "sweep-expired-scrapes": {
+            "task": "tasks.retention.sweep_expired",
             "schedule": 60.0,
         },
     },
