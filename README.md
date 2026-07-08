@@ -9,14 +9,15 @@ Full architecture, phased delivery plan, and license rationale: **[PLAN.md](PLAN
 
 ## Status
 
-**Phase D — Accounts, tiers & monetization: done.** Registration, JWT login,
-and per-tier limits are real: anonymous visitors get the same gallery/export
-as everyone else, capped by links-per-scrape and scrapes-per-IP-per-24h;
-registered accounts get higher caps, persistent history at `/account`, and
-an upgrade path to Stripe Checkout. No live Stripe account exists yet, so
-billing is verified as far as it can be without one — see
-[PLAN.md's Phase 4 notes](PLAN.md#9-phased-delivery-plan) for exactly what
-that does and doesn't cover.
+**Phase E — Admin & observability: done.** There's now an admin panel at
+`/admin` (gated by `is_superuser`, seeded via `ADMIN_BOOTSTRAP_EMAIL` since
+there's no other way to create the first one): live CPU/memory/disk,
+the disk-full forecast, proxy gateway health, a `Setting`-table editor for
+tier limits/retention/the proxy kill-switch, a `PlatformCredential` manager
+that actually flips a platform from Tier-2 scrape to Tier-1 API routing the
+moment a credential is enabled, an editable CMS for legal pages (public at
+`/legal/<slug>`), an audit-log viewer, and per-platform success/fallback-mix
+health. Flower is now behind basic auth.
 
 Delivery phases (see [PLAN.md §9](PLAN.md#9-phased-delivery-plan) for detail):
 
@@ -26,8 +27,8 @@ Delivery phases (see [PLAN.md §9](PLAN.md#9-phased-delivery-plan) for detail):
 | B | Acquisition engine (parser, worker queue, proxy gateway, lawful-use gate) | ✅ done |
 | C | Dashboard + gallery (realtime WS, storage, retention, export) | ✅ done |
 | D | Accounts, tiers & monetization | ✅ done |
-| E | Admin & observability | next |
-| F | Hardening & launch | planned |
+| E | Admin & observability | ✅ done |
+| F | Hardening & launch | next |
 
 ## Architecture at a glance
 
@@ -41,10 +42,10 @@ Delivery phases (see [PLAN.md §9](PLAN.md#9-phased-delivery-plan) for detail):
 ## Repository layout
 
 ```
-api/        FastAPI — scrapes, share, billing routes; fastapi-users auth; WS hub; tier limits
-worker/     Celery worker + beat (run_batch, crash-recovery watchdog, retention sweep, cascade)
+api/        FastAPI — scrapes/share/billing/admin/cms routes; fastapi-users auth; WS hub
+worker/     Celery worker + beat (run_batch, watchdog, retention sweep, disk predictor, cascade)
 proxy/      Self-hosted rotating proxy gateway (real: CONNECT/HTTP, SOCKS5 exits, sticky sessions)
-web/        Next.js — input form, live dashboard, gallery, login/register/account (plain Tailwind)
+web/        Next.js — input/dashboard/gallery, login/register/account, /admin/* (plain Tailwind)
 shared/     Models, parser, credential encryption, disk-layout helpers — single source of truth
 docs/       Deployment/architecture reference docs
 PLAN.md     Architecture & phased delivery plan
@@ -132,6 +133,28 @@ curl http://localhost:8000/api/me/scrapes -H "Authorization: Bearer <access_toke
 
 Media lands on disk at `/data/scrapes/<scrape_id>/<category>/`, exactly
 matching the ZIP layout the export endpoint streams directly from.
+
+## Admin
+
+Set `ADMIN_BOOTSTRAP_EMAIL` in `.env` before the first registration — that
+email becomes admin (`is_superuser` + `role=ADMIN`) automatically, since
+there's no panel yet to promote the first one. Then `/admin` has:
+
+- **Overview** — live CPU/memory/disk and the disk-full forecast, plus proxy
+  gateway health.
+- **Settings** — override any `limits.<role>.<field>`, `retention_hours`, or
+  `proxy_enabled` without a redeploy.
+- **Credentials** — add a `PlatformCredential`; an *enabled* one is what
+  actually switches that platform from the Tier-2 scrape fallback to the
+  Tier-1 API path (§4.3) — no code change, no restart.
+- **Legal pages** — edit Impressum/ToS/Privacy (or any slug), published at
+  `/legal/<slug>`.
+- **Audit log** / **Platform health** — who scraped what and when, and each
+  platform's success rate + API-vs-fallback mix.
+
+Flower (`http://localhost:5555`) is behind HTTP basic auth —
+`FLOWER_BASIC_AUTH=user:pass` in `.env` (change the example default before
+any non-local deployment).
 
 ## License
 

@@ -224,11 +224,13 @@ This keeps workers stateless w.r.t. connections and lets multiple browser tabs /
   2. **Read-time gate** (defense in depth): every gallery/share/ZIP/WS read checks `now() > expires_at` and returns 410 Gone *before* touching files — so access is cut off at the exact second even if the sweep hasn't run yet. No window where expired data is still reachable.
 - `expires_at = created_at + retention_hours` (retention configurable by admin).
 
-### 4.6 Disk-full predictor (admin)
-Hourly Beat task. Model net disk velocity accounting for the 6h deletion cycle:
+### 4.6 Disk-full predictor (admin) — ✅ implemented (Phase 5)
+Hourly Beat task (`tasks.predictor.sample_disk`). Model net disk velocity accounting for the 6h deletion cycle:
 - Sample `bytes_in_per_hour` (rolling avg of recent scrape output) and `bytes_out_per_hour` (data aging past 6h and being deleted).
 - `net_rate = bytes_in − bytes_out`. If `net_rate ≤ 0`: **stable, no forecast**. If `> 0`: `hours_to_full = free_bytes / net_rate`, surfaced with a confidence band and a threshold alert (e.g. warn at <24h).
 - Store hourly samples in a `disk_samples` table so the admin chart shows the trend, not just a number.
+
+Shipped without the confidence band or a <24h alert threshold — `/admin` shows the raw `hours_to_full` number (or "stable") plus the in/out rates, which is enough signal for v1. Layering on a color-coded warning threshold is a small frontend addition whenever it's actually wanted.
 
 ### 4.7 Audit & lawful-use attestation
 
@@ -316,32 +318,43 @@ IngressFlow/
 │   │   ├── login/, register/     # auth forms; register auto-logs in (no mailer, no verify step)
 │   │   ├── account/              # profile, tier, "Upgrade to Paid", scrape history
 │   │   ├── scrape/[token]/       # live dashboard: WS-driven stats, per-item status, cancel
-│   │   └── gallery/[token]/      # ALL/category/single-link scopes, multiselect, lightbox
-│   ├── components/NavBar.tsx     # login state, tier badge
+│   │   ├── gallery/[token]/      # ALL/category/single-link scopes, multiselect, lightbox
+│   │   ├── admin/                # overview (system/disk/proxy), settings, credentials, cms,
+│   │   │                         # audit, platforms — each page wrapped in <AdminGuard>
+│   │   └── legal/[slug]/         # public CMS render — literal text, not parsed Markdown
+│   ├── components/NavBar.tsx     # login state, tier badge, conditional Admin link
+│   ├── components/AdminGuard.tsx # redirects non-superusers away; renders the admin side-nav
 │   ├── lib/ws.ts                 # useShareSocket: WS client, exponential-backoff reconnect,
 │   │                             # treats close code 4410 (expired) as terminal, not retryable
 │   ├── lib/auth.tsx              # AuthProvider/useAuth — fetches /users/me whenever a token exists
 │   ├── lib/token.ts               # localStorage JWT (no framework deps — avoids an auth.tsx <-> api.ts cycle)
 │   ├── lib/authErrors.ts         # maps fastapi-users' machine codes (LOGIN_BAD_CREDENTIALS, …) to text
-│   └── lib/api.ts                # fetch helpers for /api/scrapes, /api/share/*, /api/auth/*, /api/billing/*
+│   ├── lib/api.ts                # fetch helpers for /api/scrapes, /api/share/*, /api/auth/*, /api/billing/*
+│   └── lib/adminApi.ts           # fetch helpers for /api/admin/*, /api/cms/* — split out from api.ts
+│                                  # once the admin surface got big enough to earn its own file
 ├── api/                         # FastAPI
 │   ├── Dockerfile
 │   ├── app/
 │   │   ├── main.py
 │   │   ├── api/routes/          # health, scrapes (submit/status/cancel/history), share (status,
-│   │   │                        # categories, media list/file, export), billing (checkout/webhook);
-│   │   │                        # fastapi-users supplies auth/jwt, auth/register, auth/verify,
-│   │   │                        # auth/reset-password, users/me — admin/cms/takedown land later
+│   │   │                        # categories, media list/file, export), billing (checkout/webhook),
+│   │   │                        # admin (settings/credentials/disk/audit/platform-health/system/
+│   │   │                        # proxy-stats — all behind current_superuser), cms (public read +
+│   │   │                        # admin write); fastapi-users supplies auth/jwt, auth/register,
+│   │   │                        # auth/verify, auth/reset-password, users/me — takedown lands later
 │   │   ├── ws/                  # health echo + share.py — the real progress hub (§4.4):
 │   │   │                        # initial snapshot on connect, then forwards Redis Pub/Sub
 │   │   │                        # (progress/done) until the client disconnects
 │   │   ├── schemas/              # Pydantic v2 (scrape submit/status/history, share status/media/
-│   │   │                         # export, user read/create/update)
+│   │   │                         # export, user read/create/update, admin/cms)
 │   │   ├── services/             # audit.py, tasks.py (enqueue/cancel), expiry.py (410 gate —
 │   │   │                         # shared by every share route), export.py (streamed ZIP),
-│   │   │                         # limits.py (tier resolution + Redis rate-limit counters)
+│   │   │                         # limits.py (tier resolution + Redis rate-limit counters),
+│   │   │                         # settings.py (generic Setting read/write, used by limits.py's
+│   │   │                         # sibling reader, scrapes.py's retention_hours, and admin.py itself)
 │   │   ├── core/                 # config, users.py (fastapi-users wiring: UserManager, JWT
-│   │   │                         # backend, current_active_user[_optional]), deps
+│   │   │                         # backend, current_active_user[_optional], current_superuser,
+│   │   │                         # ADMIN_BOOTSTRAP_EMAIL promotion), deps
 │   │   └── db/                   # async session (asyncpg) + alembic env
 │   └── alembic/
 ├── worker/                      # Celery
@@ -354,11 +367,15 @@ IngressFlow/
 │   │   ├── watchdog.py           # requeues a batch whose worker died mid-run — the actual
 │   │   │                         # fast-recovery path; see the crash-resilience note below
 │   │   ├── retention.py          # 6h sweep (§4.5): hard-delete dir, delete MediaFile rows,
-│   │   │                         # null share_token, zero aggregates, mark EXPIRED — Beat, 60s
-│   │   └── predictor.py          # disk forecast (§4.6) — Phase E
+│   │   │                         # null share_token, mark EXPIRED — Beat, 60s. Aggregate counters
+│   │   │                         # are *not* zeroed (Phase 5 change) — the disk predictor and
+│   │   │                         # account history both need that historical record.
+│   │   └── predictor.py          # hourly disk-full forecast (§4.6): bytes_in/out rate from
+│   │                              # Scrape.total_bytes, DiskSample row, Beat every 3600s
 │   └── scraping/
 │       ├── resolver.py           # url → platform; picks tier (API vs scrape) AND egress
-│       ├── session.py            # per-batch UA + sticky proxy URL, cookie lookup/decrypt
+│       ├── session.py            # per-batch UA + sticky proxy URL (skipped if Setting
+│       │                         # proxy_enabled=false), cookie lookup/decrypt
 │       └── extractors/
 │           ├── cascade.py        # yt-dlp → gallery-dl → Playwright, first success wins
 │           ├── ytdlp.py, gallerydl.py, playwright_extractor.py
@@ -432,7 +449,7 @@ services:
 
   flower:
     build: ./worker
-    command: celery -A celery_app flower --port=5555
+    command: sh -c 'celery -A celery_app flower --port=5555 --basic_auth=$$FLOWER_BASIC_AUTH'
     expose: ["5555"]             # exposed only via an NPM proxy host behind admin auth in prod
 
   redis:
@@ -524,12 +541,22 @@ Each phase ends with something demonstrable. Rough sizing assumes a small team; 
 
 **Verified via a real Playwright browser:** register → auto-login → empty history on `/account`; log out → submit anonymously (public tier) → succeeds; log back in → wrong password shows a friendly "Incorrect email or password." (not the raw `LOGIN_BAD_CREDENTIALS` code fastapi-users returns) → correct password succeeds; submit while authenticated → the scrape is attributed to the user and appears in `/account`'s history with working Dashboard/Gallery links. Tier differentiation confirmed directly against the API: 30 links rejected for an anonymous submitter (max 25) but accepted for a free-tier account (max 50); the 24h rate limit confirmed by temporarily overriding `limits.public.max_scrapes_per_period` down to 1 via a `Setting` row and observing the second anonymous submission get 429.
 
-### Phase 5 — Admin dashboard
+### Phase 5 — Admin dashboard — ✅ done
 - Live IO/CPU/disk (host metrics); Flower behind admin auth.
 - **Disk-full predictor** ([§4.6](#46-disk-full-predictor-admin)) with trend chart.
 - Settings (limits, retention); CMS for Impressum/ToS/Privacy; **encrypted `PlatformCredential` UI** for Tier-1 API keys *and* Tier-2 OAuth/cookies; **self-hosted proxy toggle** (on/off per platform) + exit-pool health view + internal bandwidth metering ([§4.8](#48-self-hosted-proxy-gateway-decided--no-commercial-providers)).
 - **Audit log viewer** (search/export who-scraped-what) and **per-platform health** incl. the API-vs-fallback mix (`source_method`).
 - **Exit:** admin can tune limits, edit legal pages, add API keys/cookies, read the disk forecast, and query the audit log.
+
+**Implementation notes:**
+- **Admin gate** = fastapi-users' own `is_superuser` flag (`current_superuser` dependency), not a separate concept from the existing `role` enum — both get set together. Since there's no admin panel yet to promote the *first* admin, `ADMIN_BOOTSTRAP_EMAIL` promotes a matching email to `is_superuser=True, role=ADMIN` the moment it registers; anyone promoted after that goes through the admin panel itself (`PATCH` isn't built for user-role management yet — deferred, see open decisions).
+- **Proxy toggle** turned out to be global, not per-platform, once actually implemented: re-reading §5's own data-model comment ("Setting key, value (…, proxy_enabled…)") confirms a single kill-switch was always the intent, not a per-platform table. A `proxy_enabled` Setting (default on) is checked once per batch when `BatchSession` is built; off routes every Tier-2 request in that batch direct instead of through the gateway.
+- **Retention behavior changed**: `tasks/retention.py` no longer zeroes `total_images`/`total_videos`/`total_bytes` on expiry (a Phase C behavior). Two things needed that historical record: the disk predictor's `bytes_out_rate` (how much data left the system by expiring) and the account history page reading better showing what a scrape *had* rather than silently zeroing it under the user. Only the physical files and `MediaFile` rows are actually gone after expiry now — the aggregate counters are a frozen historical snapshot.
+- **Disk predictor** samples hourly: `bytes_in_rate` = `total_bytes` summed over scrapes *created* in the last hour; `bytes_out_rate` = `total_bytes` summed over scrapes the retention sweep *expired* in the last hour (only possible because of the retention change above). `hours_to_full` is only set when the net rate is positive — a net rate at or below zero reports "stable" rather than a nonsensical negative ETA.
+- **CMS slugs are an open list**, not the fixed impressum/tos/privacy three originally sketched in §5 — an operator can create more legal pages later without a schema change. Rendered as literal text on the public `/legal/[slug]` page, not parsed Markdown-to-HTML — adding a Markdown renderer for what is, in v1, an admin-trusted textarea felt like unnecessary weight; worth revisiting if CMS content gets more elaborate.
+- **System/disk metrics** run from inside the `api` container via `psutil` + `shutil.disk_usage` — correct for the disk metric specifically because `MEDIA_ROOT` is a real mounted volume reflecting genuine host disk capacity; CPU/memory readings reflect whatever `psutil` sees inside the container's cgroup (host-wide here, since no resource limits are set on these containers yet).
+
+**Verified via a real Playwright browser (plus direct DB checks for the more precise assertions):** the bootstrap admin got `is_superuser` and could reach `/admin`; a second, regularly-registered account was correctly bounced back to `/` on the same URL. A `limits.public.max_links_per_scrape` override saved and listed correctly. Adding an *enabled* `youtube` credential via `/admin/credentials` and then submitting a YouTube URL produced a `FAILED` item whose error was **exactly** `api_stub.py`'s "Tier-1 API extraction … is not implemented yet" message — direct proof the credential flipped `resolver.route()`'s tier decision from scrape to API, cross-checked against the same URL's *prior* `SUCCESS` rows (via yt-dlp, Tier-2) from before any credential existed. Editing the `impressum` CMS page and then loading `/legal/impressum` showed the saved text. The audit log and per-platform health views rendered real accumulated data across every phase's testing (54 items on unrecognized test domains, 7 on youtube: 6 historical Tier-2 successes + the 1 fresh Tier-1 failure). The disk-full predictor was triggered manually (real hourly cadence being too slow to wait out) and produced a correct sample — free space read from the real mounted volume, `hours_to_full` correctly `null`/"stable" since net rate was ≤ 0. Flower's basic auth was confirmed to reject no-credential and wrong-credential requests with 401 and accept the right ones with 200.
 
 ### Phase 6 — Hardening & launch
 - Compliance pass ([§10](#10-legal--compliance-risk)): DMCA/takedown endpoint (writes to audit log), attestation-text/ToS legal sign-off, GDPR data-handling doc, secret-encryption review.
@@ -614,3 +641,6 @@ If you want stronger anti-competition protection and can accept **"source-availa
 5. **Mailer**: Phase 4 shipped auth with no SMTP wired — verification/reset tokens are logged, not emailed, and the frontend auto-logs a user in after registration rather than making them complete a verification step that has nowhere to send its email yet. Wiring a real transactional-email provider (and then actually gating login on `is_verified`) is Phase F territory.
 6. **JWT refresh**: v1 uses a single 7-day access token with no refresh-token rotation — simplest thing that works; revisit if session length or revocation-on-demand becomes a real requirement.
 7. **Stripe**: no live account/keys exist for this project yet. The webhook handler's event-processing logic is verified (locally-signed test events); Checkout-session creation is real code but has never been exercised against Stripe's actual API. Needs a real test-mode Stripe account + `STRIPE_SECRET_KEY`/`STRIPE_WEBHOOK_SECRET`/`STRIPE_PRICE_ID` before launch.
+8. **Promoting admins after the first one**: `ADMIN_BOOTSTRAP_EMAIL` only seeds the very first admin, on registration. There's no "make this existing user an admin" UI yet — for now that's a direct DB update (`UPDATE users SET is_superuser=true, role='ADMIN' WHERE email=...`). A small admin-panel affordance for this is easy to add whenever it's actually needed.
+9. **CMS rendering**: `/legal/[slug]` renders `content_md` as literal preformatted text, not parsed Markdown-to-HTML. Fine for short legal text typed by a trusted admin; revisit if CMS content needs real formatting (headings, links, lists).
+10. **Flower's default credentials**: `.env.example` ships `FLOWER_BASIC_AUTH=admin:changeme` as a visible placeholder — change it (and `ADMIN_BOOTSTRAP_EMAIL`/`SECRET_KEY`/`CREDENTIAL_ENCRYPTION_KEY`) before any non-local deployment. None of these are secret-scanned or enforced-different-from-default anywhere yet.
