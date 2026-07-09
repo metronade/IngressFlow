@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { useParams } from "next/navigation";
 import Link from "next/link";
 import { cancelScrape, getShareStatus, type ShareStatus } from "@/lib/api";
+import { copyToClipboard } from "@/lib/clipboard";
 import { useShareSocket } from "@/lib/ws";
 
 function statusColor(status: string): string {
@@ -42,11 +43,35 @@ function Stat({ label, value }: { label: string; value: string }) {
   );
 }
 
+// The plain gray "running" text badge was easy to miss — nothing on screen
+// otherwise hints that the batch is still alive between WS updates, which
+// can be seconds apart (jitter delay + extraction time per link). A
+// pulsing dot is the standard "still working" signal for exactly this.
+function StatusBadge({ status }: { status: string }) {
+  const isActive = status === "queued" || status === "running";
+  return (
+    <span
+      className={`flex items-center gap-2 rounded-full px-3 py-1 text-sm capitalize ${
+        isActive ? "bg-blue-950 text-blue-300" : "bg-neutral-800"
+      }`}
+    >
+      {isActive && (
+        <span className="relative flex h-2 w-2">
+          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-blue-400 opacity-75" />
+          <span className="relative inline-flex h-2 w-2 rounded-full bg-blue-400" />
+        </span>
+      )}
+      {status}
+    </span>
+  );
+}
+
 export default function ScrapeDashboard() {
   const { token } = useParams<{ token: string }>();
   const { snapshot, done, expired } = useShareSocket(token);
   const [status, setStatus] = useState<ShareStatus | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [copyFailedId, setCopyFailedId] = useState<string | null>(null);
   const [notified, setNotified] = useState(false);
 
   useEffect(() => {
@@ -78,9 +103,14 @@ export default function ScrapeDashboard() {
   }, [done, notified]);
 
   async function handleCopy(url: string, id: string) {
-    await navigator.clipboard.writeText(url);
-    setCopiedId(id);
-    setTimeout(() => setCopiedId(null), 1500);
+    const ok = await copyToClipboard(url);
+    if (ok) {
+      setCopiedId(id);
+      setTimeout(() => setCopiedId(null), 1500);
+    } else {
+      setCopyFailedId(id);
+      setTimeout(() => setCopyFailedId(null), 2000);
+    }
   }
 
   async function handleCancel() {
@@ -102,6 +132,10 @@ export default function ScrapeDashboard() {
   const currentStatus = snapshot?.status ?? status?.status ?? "queued";
   const isRunning = currentStatus === "queued" || currentStatus === "running";
 
+  const succeeded = status?.items.filter((i) => i.status === "success").length ?? 0;
+  const partial = status?.items.filter((i) => i.status === "partial").length ?? 0;
+  const failed = status?.items.filter((i) => i.status === "failed").length ?? 0;
+
   return (
     <main className="mx-auto flex min-h-screen max-w-3xl flex-col gap-6 p-8">
       <h1 className="text-2xl font-semibold">Scrape progress</h1>
@@ -114,7 +148,7 @@ export default function ScrapeDashboard() {
       </div>
 
       <div className="flex items-center gap-3">
-        <span className="rounded-full bg-neutral-800 px-3 py-1 text-sm capitalize">{currentStatus}</span>
+        <StatusBadge status={currentStatus} />
         {isRunning ? (
           <button
             onClick={handleCancel}
@@ -128,6 +162,14 @@ export default function ScrapeDashboard() {
           </Link>
         )}
       </div>
+
+      {!isRunning && status && (
+        <p className="-mt-3 text-sm text-neutral-400">
+          Scrape finished: {succeeded}/{linksTotal} link{linksTotal === 1 ? "" : "s"} succeeded
+          {partial > 0 && `, ${partial} partial (some files failed)`}
+          {failed > 0 && `, ${failed} failed (nothing found or an error occurred)`}.
+        </p>
+      )}
 
       <ul className="flex flex-col gap-2">
         {status?.items.map((item) => (
@@ -150,9 +192,9 @@ export default function ScrapeDashboard() {
             </Link>
             <button
               onClick={() => handleCopy(item.url, item.id)}
-              className="shrink-0 text-neutral-400 hover:text-neutral-200"
+              className={`shrink-0 hover:text-neutral-200 ${copyFailedId === item.id ? "text-red-400" : "text-neutral-400"}`}
             >
-              {copiedId === item.id ? "Copied" : "Copy link"}
+              {copiedId === item.id ? "Copied" : copyFailedId === item.id ? "Copy failed" : "Copy link"}
             </button>
           </li>
         ))}
