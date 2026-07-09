@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.users import current_active_user, current_active_user_optional
 from app.db.session import get_db
 from app.schemas.scrape import (
+    LimitsOut,
     ScrapeHistoryOut,
     ScrapeItemStatusOut,
     ScrapeStatusResponse,
@@ -29,6 +30,22 @@ DEFAULT_RETENTION_HOURS = 6
 
 def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
+
+
+@router.get("/limits", response_model=LimitsOut)
+async def get_limits(
+    db: AsyncSession = Depends(get_db),
+    user: User | None = Depends(current_active_user_optional),
+) -> LimitsOut:
+    """Lets the frontend show the caller's actual current tier limits
+    instead of leaving the 100-link architectural ceiling (and the tier
+    caps under it) invisible until a submission is rejected for it."""
+    limits = await resolve_limits(db, user)
+    return LimitsOut(
+        role=limits.role.value,
+        max_links_per_scrape=limits.max_links_per_scrape,
+        max_scrapes_per_period=limits.max_scrapes_per_period,
+    )
 
 
 @router.post("/scrapes", response_model=ScrapeSubmitResponse, status_code=201)

@@ -41,6 +41,16 @@ export type SubmitResponse = {
   links_total: number;
 };
 
+export type LimitsInfo = {
+  role: string;
+  max_links_per_scrape: number;
+  max_scrapes_per_period: number | null;
+};
+
+export function getLimits() {
+  return request<LimitsInfo>("/api/limits", { headers: authHeaders() });
+}
+
 export function submitScrape(rawText: string, config: ScrapeConfig, attestationVersion: string) {
   return request<SubmitResponse>("/api/scrapes", {
     method: "POST",

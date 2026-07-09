@@ -1,8 +1,8 @@
 "use client";
 
-import { type FormEvent, useState } from "react";
+import { type FormEvent, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ApiError, submitScrape } from "@/lib/api";
+import { ApiError, type LimitsInfo, getLimits, submitScrape } from "@/lib/api";
 
 const ATTESTATION_TEXT_VERSION = "v1";
 
@@ -13,6 +13,12 @@ https://example.com/b
 L1235
 https://example.com/c`;
 
+function countLinks(text: string): number {
+  return text
+    .split("\n")
+    .filter((line) => /^https?:\/\//.test(line.trim())).length;
+}
+
 export default function Home() {
   const router = useRouter();
   const [rawText, setRawText] = useState("");
@@ -22,6 +28,16 @@ export default function Home() {
   const [attested, setAttested] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [limits, setLimits] = useState<LimitsInfo | null>(null);
+
+  useEffect(() => {
+    getLimits()
+      .then(setLimits)
+      .catch(() => {});
+  }, []);
+
+  const linkCount = useMemo(() => countLinks(rawText), [rawText]);
+  const overLimit = limits != null && linkCount > limits.max_links_per_scrape;
 
   function handleVideoOnly(checked: boolean) {
     setVideoOnly(checked);
@@ -64,6 +80,13 @@ export default function Home() {
           Paste a category header followed by its links. A blank line or a new header starts the
           next category.
         </p>
+        {limits && (
+          <p className="mt-1 text-sm text-neutral-500">
+            Max {limits.max_links_per_scrape} links per scrape
+            {limits.max_scrapes_per_period != null && ` · ${limits.max_scrapes_per_period} scrapes per 24h`}
+            {" "}({limits.role} tier)
+          </p>
+        )}
       </div>
 
       <pre className="whitespace-pre-wrap rounded-lg border border-neutral-800 bg-neutral-900 p-3 text-sm text-neutral-500">
@@ -79,6 +102,13 @@ export default function Home() {
           required
           className="rounded-lg border border-neutral-800 bg-neutral-900 p-3 font-mono text-sm focus:border-neutral-600 focus:outline-none"
         />
+        {linkCount > 0 && (
+          <p className={`-mt-2 text-xs ${overLimit ? "text-red-400" : "text-neutral-500"}`}>
+            {linkCount} link{linkCount === 1 ? "" : "s"}
+            {limits && ` / ${limits.max_links_per_scrape} max`}
+            {overLimit && " — exceeds your tier's limit"}
+          </p>
+        )}
 
         <div className="flex flex-wrap gap-4 text-sm">
           <label className="flex items-center gap-2">
@@ -116,7 +146,7 @@ export default function Home() {
 
         <button
           type="submit"
-          disabled={submitting || !attested || rawText.trim().length === 0}
+          disabled={submitting || !attested || rawText.trim().length === 0 || overLimit}
           className="rounded-lg bg-blue-600 px-4 py-2 font-medium text-white transition hover:bg-blue-500 disabled:cursor-not-allowed disabled:opacity-50"
         >
           {submitting ? "Submitting…" : "Start scrape"}

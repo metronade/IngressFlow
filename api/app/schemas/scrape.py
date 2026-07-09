@@ -59,3 +59,9 @@ class ScrapeHistoryOut(BaseModel):
     total_bytes: int
     created_at: datetime
     expires_at: datetime
+
+
+class LimitsOut(BaseModel):
+    role: str
+    max_links_per_scrape: int
+    max_scrapes_per_period: int | None  # null = no cap (paid/admin default)
