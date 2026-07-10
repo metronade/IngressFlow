@@ -9,5 +9,5 @@ COPY gateway.py .
 # overrides this by bind-mounting their own exits.yml (see docs/PROXY.md).
 COPY exits.example.yml exits.yml
 
-EXPOSE 8888
+EXPOSE 8888 8889
 CMD ["python", "gateway.py"]

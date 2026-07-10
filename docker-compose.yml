@@ -91,7 +91,13 @@ services:
   proxy:
     build:
       context: ./proxy
-    expose: ["8888"] # internal only — never published to the host edge
+    env_file: .env
+    # 8888: plain proxy traffic (workers only). 8889: residential agent
+    # WebSocket control channel (§4.8a) — in prod this is *not* published to
+    # the host either; NPM fronts it on the same public domain as everything
+    # else (wss://<domain>/agent/connect -> proxy:8889), so a residential
+    # node never needs an inbound port, and the RZ never needs a new one.
+    expose: ["8888", "8889"]
 
   redis:
     image: redis:7-alpine
