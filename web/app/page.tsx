@@ -6,12 +6,27 @@ import { ApiError, type LimitsInfo, getLimits, submitScrape } from "@/lib/api";
 
 const ATTESTATION_TEXT_VERSION = "v1";
 
-const EXAMPLE = `L1234
+const EXAMPLE = `Group 1
 https://example.com/a
 https://example.com/b
 
-L1235
+Group 2
 https://example.com/c`;
+
+// Platforms the parser/extractor cascade recognizes by name (resolver.py's
+// _PLATFORM_DOMAINS) — the ones a Tier-1 API key can ever be enabled for.
+// Anything else is still attempted via the generic yt-dlp/gallery-dl/
+// Playwright cascade, just without a named-platform guarantee.
+const SUPPORTED_PLATFORMS = [
+  "YouTube",
+  "TikTok",
+  "Instagram",
+  "X / Twitter",
+  "Facebook",
+  "Reddit",
+  "Snapchat",
+  "Vimeo",
+];
 
 function countLinks(text: string): number {
   return text
@@ -80,18 +95,23 @@ export default function Home() {
           Paste a category header followed by its links. A blank line or a new header starts the
           next category.
         </p>
+        <div className="mt-2 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-neutral-500">
+          <span className="text-neutral-600">Officially supported:</span>
+          {SUPPORTED_PLATFORMS.map((name) => (
+            <span key={name} className="rounded-full border border-neutral-800 px-2 py-0.5">
+              {name}
+            </span>
+          ))}
+          <span className="text-neutral-600">— other links are still attempted, best-effort.</span>
+        </div>
         {limits && (
-          <p className="mt-1 text-sm text-neutral-500">
+          <p className="mt-2 text-sm text-neutral-500">
             Max {limits.max_links_per_scrape} links per scrape
             {limits.max_scrapes_per_period != null && ` · ${limits.max_scrapes_per_period} scrapes per 24h`}
             {" "}({limits.role} tier)
           </p>
         )}
       </div>
-
-      <pre className="whitespace-pre-wrap rounded-lg border border-neutral-800 bg-neutral-900 p-3 text-sm text-neutral-500">
-        {EXAMPLE}
-      </pre>
 
       <form onSubmit={handleSubmit} className="flex flex-col gap-4">
         <textarea
