@@ -267,6 +267,53 @@ The **resolver** ([§4.3](#43-scraping-core--api-first-extractor-strategy)) ther
 
 **Honest caveat on "residential":** a Docker container cannot itself *manufacture* residential IPs — the "residential" property comes from an IP living on a consumer ISP. A pure single-host deployment routes through the **host's own (datacenter/VPS) IP**, which platforms detect more easily. To get genuinely residential exits, the gateway must be **fed upstream exit nodes** the operator controls — e.g. mobile LTE modems/dongles, home endpoints, or self-hosted SOCKS/VPN exits. So the gateway's *design* is provider-agnostic rotation; the *residential quality* depends entirely on what exits you attach. This is a deliberate cost/control trade-off vs. the dropped commercial providers, and it's an operator responsibility to document ([§10](#10-legal--compliance-risk)). Admin toggle stays: proxy on/off, per-platform, off by default.
 
+#### 4.8a Residential proxy mesh — self-registering agents (planned, not yet built)
+
+**The gap this closes:** `exits.yml` ([above](#48-self-hosted-proxy-gateway-decided--no-commercial-providers)) assumes the gateway can *dial out* to a fixed, inbound-reachable `host:port` — fine for a VPS/LTE modem with a real address, but most home connections (the actual target for genuine residential exits) sit behind NAT or CGNAT with no stable reachable address at all. **Decided approach: the exit dials the gateway, not the other way around** — the same "call home" pattern real commercial residential-proxy networks use. This also makes adding exits at multiple friends'/family's homes an admin-panel operation instead of a YAML edit + redeploy.
+
+**Transport — WebSocket over the existing HTTPS edge, deliberately not a new port.** The agent's control connection is a WebSocket to `wss://<domain>/agent/connect`, fronted by the same Nginx Proxy Manager host already terminating everything else (same pattern as the existing share-progress WS hub, [§4.4](#44-realtime-pipeline-websockets)). Consequences:
+- **Zero open ports on the residential side** — purely an outbound connection, works behind NAT/CGNAT with no router configuration at all.
+- **No new port on the RZ side either** — no dedicated TCP listener, no Stream/TCP passthrough host to configure in NPM; it's one more route on the domain that's already public.
+- Looks like ordinary outbound HTTPS from the home network's perspective — passes through virtually any home/guest firewall.
+
+**Relay protocol.** Because a batch is processed strictly sequentially with one exit pinned for its whole lifetime ([§4.2](#42-the-worker-queue-the-core-design)), at most one relayed connection per node is ever active at a time in practice — so this doesn't need a generic multi-stream multiplexer, just a minimal framed control protocol over the one WebSocket:
+- `open {stream_id, host, port}` (gateway → agent) — request an outbound connection from the agent's home network.
+- `opened {stream_id}` / `error {stream_id, message}` (agent → gateway).
+- binary data frames tagged with `stream_id`, both directions.
+- `close {stream_id}` either direction.
+
+**Data model — new `ProxyNode` entity:**
+```
+ProxyNode   id, name, token_hash (never stores the plaintext — same one-time-reveal
+            pattern as PlatformCredential secrets), priority (lower tried first),
+            enabled, last_seen_at, created_at
+```
+Durable admin config (name/priority/enabled/token) lives here in Postgres, managed via `api`'s admin routes exactly like `Setting`/`PlatformCredential` already are. **Live state (currently connected, recent failure streak, bytes relayed) stays in the gateway process's memory** — it's the one thing actually holding the connections — and is surfaced to the admin UI the same way `/api/admin/proxy-stats` already surfaces the gateway's `/stats`. The `api` service pushes the current node/token allowlist to the gateway (a small internal, shared-secret-protected endpoint) after any admin change, so the `proxy` container never needs its own DB driver/ORM dependency.
+
+**Priority + automatic failover (admin-configurable, replaces plain round-robin for agent exits):**
+1. Only `enabled=True` **and currently connected** nodes are candidates.
+2. Group by `priority` ascending; try the lowest-numbered tier first.
+3. **Circuit breaker per node:** N consecutive failed relay attempts (e.g. 3) demote a node out of selection for a cooldown window (e.g. 2 minutes); a single success resets its failure count to zero immediately.
+4. If every node at the current tier is disconnected/demoted, fall through to the next priority tier.
+5. If nothing usable remains at any tier, fall back to direct passthrough — same honest degrade-gracefully behavior as today's empty `exits.yml`, never a hard batch failure just because residential exits are unavailable.
+
+This directly gives "route primarily through residential #1; if it's only producing errors, fall through to #2" without any manual admin intervention when a node is having a bad day.
+
+**Admin UI — new "Residential Nodes" page** (own nav entry alongside Settings/Credentials/CMS/Audit/Platform health): table of name / priority (editable) / live status (connected · disconnected · in-cooldown) / enabled toggle / last-seen / bytes relayed; an "add node" form that generates a token and shows it once alongside the exact `.env` snippet for the agent container.
+
+**New/changed files (not yet built):**
+| File | Change |
+|---|---|
+| `shared/models/proxy_node.py` + migration | new |
+| `api/app/schemas/admin.py` | `ProxyNodeOut/Create/Update` |
+| `api/app/api/routes/admin.py` | CRUD `/admin/proxy-nodes`, triggers gateway resync |
+| `proxy/gateway.py` | agent WS listener, node allowlist, priority/failover `assign_exit`, live node status endpoint |
+| `proxy/agent.py` | new — the home-side container |
+| `web/app/admin/proxy-nodes/page.tsx` | new |
+| `.env` | `PROXY_INTERNAL_SECRET` (api ↔ gateway allowlist push) |
+
+Static `exits.yml` entries (VPS/LTE-modem-style, already inbound-reachable) keep working unchanged alongside agent-registered nodes — same exit pool, same priority/failover logic; the agent model is additive, not a replacement.
+
 ---
 
 ## 5. Data Model (core entities)
@@ -648,3 +695,4 @@ If you want stronger anti-competition protection and can accept **"source-availa
 8. **Promoting admins after the first one**: `ADMIN_BOOTSTRAP_EMAIL` only seeds the very first admin, on registration. There's no "make this existing user an admin" UI yet — for now that's a direct DB update (`UPDATE users SET is_superuser=true, role='ADMIN' WHERE email=...`). A small admin-panel affordance for this is easy to add whenever it's actually needed.
 9. **CMS rendering**: `/legal/[slug]` renders `content_md` as literal preformatted text, not parsed Markdown-to-HTML. Fine for short legal text typed by a trusted admin; revisit if CMS content needs real formatting (headings, links, lists).
 10. **Flower's default credentials**: `.env.example` ships `FLOWER_BASIC_AUTH=admin:changeme` as a visible placeholder — change it (and `ADMIN_BOOTSTRAP_EMAIL`/`SECRET_KEY`/`CREDENTIAL_ENCRYPTION_KEY`) before any non-local deployment. None of these are secret-scanned or enforced-different-from-default anywhere yet.
+11. **Residential proxy mesh** ([§4.8a](#48a-residential-proxy-mesh--self-registering-agents-planned-not-yet-built)): design is agreed (self-registering agents over WebSocket, `ProxyNode` table, priority + circuit-breaker failover, dedicated admin page) but **not yet implemented** — no `proxy/agent.py`, no `ProxyNode` model/migration, no gateway-side agent listener exist yet. Build order when picked up: `ProxyNode` model + migration first, then the gateway's agent WS listener + priority/failover `assign_exit`, then `proxy/agent.py`, then the admin CRUD routes + UI page last (so there's something real for it to manage by the time it's built).
