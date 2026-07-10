@@ -12,6 +12,7 @@ const ADMIN_LINKS = [
   { href: "/admin/cms", label: "Legal pages" },
   { href: "/admin/audit", label: "Audit log" },
   { href: "/admin/platforms", label: "Platform health" },
+  { href: "/admin/proxy-nodes", label: "Residential nodes" },
 ];
 
 export function AdminGuard({ children }: { children: React.ReactNode }) {

@@ -171,3 +171,42 @@ export async function getPublicCmsPage(slug: string): Promise<CmsPage> {
   if (!res.ok) throw new Error("Not found");
   return res.json();
 }
+
+// -- residential proxy nodes (§4.8a) -------------------------------------------
+
+export type ProxyNode = {
+  id: string;
+  name: string;
+  priority: number;
+  enabled: boolean;
+  last_seen_at: string | null;
+  created_at: string;
+  connected: boolean | null;
+  demoted: boolean | null;
+  consecutive_failures: number | null;
+  bytes_relayed: number | null;
+};
+
+export function getProxyNodes() {
+  return adminRequest<ProxyNode[]>("/api/admin/proxy-nodes");
+}
+
+export function createProxyNode(name: string, priority: number) {
+  return adminRequest<{ node: ProxyNode; token: string }>("/api/admin/proxy-nodes", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, priority }),
+  });
+}
+
+export function updateProxyNode(id: string, data: { priority?: number; enabled?: boolean }) {
+  return adminRequest<ProxyNode>(`/api/admin/proxy-nodes/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+}
+
+export function deleteProxyNode(id: string) {
+  return adminRequest<void>(`/api/admin/proxy-nodes/${id}`, { method: "DELETE" });
+}
