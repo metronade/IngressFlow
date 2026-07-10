@@ -267,7 +267,7 @@ The **resolver** ([§4.3](#43-scraping-core--api-first-extractor-strategy)) ther
 
 **Honest caveat on "residential":** a Docker container cannot itself *manufacture* residential IPs — the "residential" property comes from an IP living on a consumer ISP. A pure single-host deployment routes through the **host's own (datacenter/VPS) IP**, which platforms detect more easily. To get genuinely residential exits, the gateway must be **fed upstream exit nodes** the operator controls — e.g. mobile LTE modems/dongles, home endpoints, or self-hosted SOCKS/VPN exits. So the gateway's *design* is provider-agnostic rotation; the *residential quality* depends entirely on what exits you attach. This is a deliberate cost/control trade-off vs. the dropped commercial providers, and it's an operator responsibility to document ([§10](#10-legal--compliance-risk)). Admin toggle stays: proxy on/off, per-platform, off by default.
 
-#### 4.8a Residential proxy mesh — self-registering agents (planned, not yet built)
+#### 4.8a Residential proxy mesh — self-registering agents — ✅ done
 
 **The gap this closes:** `exits.yml` ([above](#48-self-hosted-proxy-gateway-decided--no-commercial-providers)) assumes the gateway can *dial out* to a fixed, inbound-reachable `host:port` — fine for a VPS/LTE modem with a real address, but most home connections (the actual target for genuine residential exits) sit behind NAT or CGNAT with no stable reachable address at all. **Decided approach: the exit dials the gateway, not the other way around** — the same "call home" pattern real commercial residential-proxy networks use. This also makes adding exits at multiple friends'/family's homes an admin-panel operation instead of a YAML edit + redeploy.
 
@@ -301,16 +301,23 @@ This directly gives "route primarily through residential #1; if it's only produc
 
 **Admin UI — new "Residential Nodes" page** (own nav entry alongside Settings/Credentials/CMS/Audit/Platform health): table of name / priority (editable) / live status (connected · disconnected · in-cooldown) / enabled toggle / last-seen / bytes relayed; an "add node" form that generates a token and shows it once alongside the exact `.env` snippet for the agent container.
 
-**New/changed files (not yet built):**
+**New/changed files:**
 | File | Change |
 |---|---|
-| `shared/models/proxy_node.py` + migration | new |
-| `api/app/schemas/admin.py` | `ProxyNodeOut/Create/Update` |
-| `api/app/api/routes/admin.py` | CRUD `/admin/proxy-nodes`, triggers gateway resync |
-| `proxy/gateway.py` | agent WS listener, node allowlist, priority/failover `assign_exit`, live node status endpoint |
-| `proxy/agent.py` | new — the home-side container |
-| `web/app/admin/proxy-nodes/page.tsx` | new |
-| `.env` | `PROXY_INTERNAL_SECRET` (api ↔ gateway allowlist push) |
+| `shared/models/ops.py` (`ProxyNode`) + migration `cf8402fc4f5a` | new |
+| `api/app/core/config.py` | `proxy_internal_url`, `proxy_internal_secret` |
+| `api/app/schemas/admin.py` | `ProxyNodeOut/Create/Update/Created` |
+| `api/app/api/routes/admin.py` | CRUD `/admin/proxy-nodes`, pushes gateway resync after every change |
+| `proxy/gateway.py` | agent WS listener (`:8889`), `Exit.kind="agent"`, `AgentSession`/`AgentStream`, priority/circuit-breaker `assign_exit`, `/internal/nodes/sync`, `node_id` in `/stats` |
+| `proxy/agent.py` + `Dockerfile.agent` + `requirements.agent.txt` | new — the home-side container (own lightweight image, only depends on `websockets`) |
+| `web/app/admin/proxy-nodes/page.tsx` + `web/lib/adminApi.ts` additions | new |
+| `docker-compose.agent.yml` + `.env.agent.example` | new — the deployment artifact for the residential machine |
+| `docker-compose.yml` (`proxy` service) | `expose: ["8888", "8889"]`, `env_file: .env` (for `PROXY_INTERNAL_SECRET`) |
+| `.env` / `.env.example` | `PROXY_INTERNAL_SECRET` |
+
+**Verified with a real second container standing in for a residential machine** (not just unit-level checks): built `proxy/agent.py` into its own image, ran it alongside the stack, and drove the whole flow through the actual `api` admin routes — created a node (got a real one-time token back), connected the agent with that exact token, watched `GET /admin/proxy-nodes` flip to `connected: true` within one 10s UI poll, then sent a real HTTPS request through the gateway's plain proxy port and confirmed via `/stats` that `bytes_relayed` on that node incremented — proof the tunnel actually carries traffic, not just a control handshake. Then registered a second, lower-priority node and confirmed: a fresh session picked the higher-priority node first; killing that node's connection failed traffic over to the second automatically; and — separately — forcing 3 consecutive failures on a *still-connected* node (targeting an unresolvable host) demoted it into cooldown while it stayed nominally "connected", correctly routing subsequent traffic to the other node without any admin action. Finally, submitted a real scrape through the actual worker/`run_batch` path (not a raw curl) with only one residential node connected, and confirmed via the gateway's stats that the batch's traffic really did relay through it.
+
+**Honest finding from that last test:** the relayed session showed up under the gateway's `"default"` session bucket rather than `session-<scrape_id>` — `session.py`'s per-batch sticky-session username isn't reliably reaching the gateway as a `Proxy-Authorization` header through every Tier-2 tool in the cascade (some of yt-dlp/gallery-dl/Playwright's own HTTP clients likely don't forward it the same way). With only one exit in the pool this doesn't matter (there's nothing to be sticky *across*), but it means per-batch exit affinity (pin one IP for a whole batch, §4.2) isn't guaranteed once there are multiple residential nodes in rotation and a single batch makes more than one request. This predates §4.8a (the same mechanism is used for static `exits.yml` entries) and wasn't something this work was scoped to fix — worth a closer look before relying on strict per-batch affinity across multiple simultaneous residential nodes.
 
 Static `exits.yml` entries (VPS/LTE-modem-style, already inbound-reachable) keep working unchanged alongside agent-registered nodes — same exit pool, same priority/failover logic; the agent model is additive, not a replacement.
 
@@ -342,6 +349,8 @@ LawfulAttestation   id, scrape_id, text_version, accepted (bool), actor_user_id 
 AuditLog        id, ts, actor_user_id (nullable), actor_ip, action, target_type, target_id,
                 detail(jsonb)                             # append-only; who did what, when (§4.7)
 DiskSample      id, ts, free_bytes, bytes_in_rate, bytes_out_rate, hours_to_full
+ProxyNode       id, name, token_hash, priority, enabled, last_seen_at, created_at (§4.8a —
+                durable admin config only; live connection state stays in the gateway process)
 ```
 
 Notes:
@@ -371,7 +380,8 @@ IngressFlow/
 │   │   ├── scrape/[token]/       # live dashboard: WS-driven stats, per-item status, cancel
 │   │   ├── gallery/[token]/      # ALL/category/single-link scopes, multiselect, lightbox
 │   │   ├── admin/                # overview (system/disk/proxy), settings, credentials, cms,
-│   │   │                         # audit, platforms — each page wrapped in <AdminGuard>
+│   │   │                         # audit, platforms, proxy-nodes (§4.8a) — each page wrapped
+│   │   │                         # in <AdminGuard>
 │   │   └── legal/[slug]/         # public CMS render — literal text, not parsed Markdown
 │   ├── components/NavBar.tsx     # login state, tier badge, conditional Admin link
 │   ├── components/AdminGuard.tsx # redirects non-superusers away; renders the admin side-nav
@@ -431,13 +441,16 @@ IngressFlow/
 │           ├── cascade.py        # yt-dlp → gallery-dl → Playwright, first success wins
 │           ├── ytdlp.py, gallerydl.py, playwright_extractor.py
 │           └── api_stub.py       # Tier-1 extraction point — built, deliberately inactive (§12)
-├── proxy/                       # self-hosted rotating proxy gateway (§4.8)
-│   ├── Dockerfile
-│   ├── gateway.py                # asyncio HTTP/CONNECT proxy; SOCKS5 upstream exits; sticky
-│   │                             # sessions via Proxy-Authorization; health-check/eviction; /stats
-│   └── exits.example.yml         # operator-supplied upstream exit nodes (empty by default)
+├── proxy/                       # self-hosted rotating proxy gateway (§4.8, §4.8a)
+│   ├── Dockerfile                # gateway image (:8888 plain proxy, :8889 agent WS)
+│   ├── gateway.py                # asyncio HTTP/CONNECT proxy; dial (SOCKS5) + agent (WS) exits;
+│   │                             # priority + circuit-breaker assign_exit; health-check/eviction;
+│   │                             # /stats, /internal/nodes/sync
+│   ├── exits.example.yml         # operator-supplied static upstream exit nodes (empty by default)
+│   ├── agent.py                  # §4.8a residential agent — runs on the OTHER machine, not here
+│   ├── Dockerfile.agent, requirements.agent.txt  # separate, lighter image for agent.py
 ├── shared/                      # single source of truth for api + worker
-│   ├── models/                   # SQLAlchemy (all 12 entities, §5)
+│   ├── models/                   # SQLAlchemy (all 13 entities, §5)
 │   ├── parsing.py                # category-header text parser — lives here, not under
 │   │                             # worker/scraping/, since the API needs it at submit time
 │   ├── crypto.py                 # Fernet encrypt/decrypt for PlatformCredential.secret_blob
@@ -695,4 +708,5 @@ If you want stronger anti-competition protection and can accept **"source-availa
 8. **Promoting admins after the first one**: `ADMIN_BOOTSTRAP_EMAIL` only seeds the very first admin, on registration. There's no "make this existing user an admin" UI yet — for now that's a direct DB update (`UPDATE users SET is_superuser=true, role='ADMIN' WHERE email=...`). A small admin-panel affordance for this is easy to add whenever it's actually needed.
 9. **CMS rendering**: `/legal/[slug]` renders `content_md` as literal preformatted text, not parsed Markdown-to-HTML. Fine for short legal text typed by a trusted admin; revisit if CMS content needs real formatting (headings, links, lists).
 10. **Flower's default credentials**: `.env.example` ships `FLOWER_BASIC_AUTH=admin:changeme` as a visible placeholder — change it (and `ADMIN_BOOTSTRAP_EMAIL`/`SECRET_KEY`/`CREDENTIAL_ENCRYPTION_KEY`) before any non-local deployment. None of these are secret-scanned or enforced-different-from-default anywhere yet.
-11. **Residential proxy mesh** ([§4.8a](#48a-residential-proxy-mesh--self-registering-agents-planned-not-yet-built)): design is agreed (self-registering agents over WebSocket, `ProxyNode` table, priority + circuit-breaker failover, dedicated admin page) but **not yet implemented** — no `proxy/agent.py`, no `ProxyNode` model/migration, no gateway-side agent listener exist yet. Build order when picked up: `ProxyNode` model + migration first, then the gateway's agent WS listener + priority/failover `assign_exit`, then `proxy/agent.py`, then the admin CRUD routes + UI page last (so there's something real for it to manage by the time it's built).
+11. **Residential proxy mesh** ([§4.8a](#48a-residential-proxy-mesh--self-registering-agents--done)): built and verified with a real second container standing in for a residential machine. Open follow-up: per-batch sticky-session affinity (§4.2) isn't reliably reaching the gateway through every Tier-2 tool in the cascade — harmless with a single exit, but worth fixing before relying on strict per-batch IP affinity across multiple simultaneous residential nodes.
+12. **Agent reconnection has no backoff cap**: `proxy/agent.py` retries every 5s forever on any disconnect (including auth failure after a node is deleted/disabled) — fine for now, but a deleted-and-forgotten agent container will log a warning every 5s indefinitely. Exponential backoff (capped) would be a small, easy improvement.

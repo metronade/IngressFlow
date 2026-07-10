@@ -151,6 +151,14 @@ there's no panel yet to promote the first one. Then `/admin` has:
   `/legal/<slug>`.
 - **Audit log** / **Platform health** — who scraped what and when, and each
   platform's success rate + API-vs-fallback mix.
+- **Residential nodes** ([§4.8a](PLAN.md#48a-residential-proxy-mesh--self-registering-agents--done)) —
+  add a self-registering residential proxy node (e.g. a friend's home Docker
+  box), get a one-time token, set priority. A connected, enabled node with
+  the lowest priority number is preferred for Tier-2 scrape traffic; one
+  that starts only erroring is automatically taken out of rotation for a
+  cooldown period. See `docker-compose.agent.yml` for the deployment
+  artifact that runs on the residential side — it makes an outbound-only
+  connection, no port forwarding needed on that network.
 
 Flower (`http://localhost:5555`) is behind HTTP basic auth —
 `FLOWER_BASIC_AUTH=user:pass` in `.env` (change the example default before
