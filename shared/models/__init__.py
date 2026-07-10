@@ -8,7 +8,7 @@ from .enums import (
     UserRole,
 )
 from .governance import AuditLog, LawfulAttestation, PlatformCredential
-from .ops import CmsPage, DiskSample, Setting, UsageEvent
+from .ops import CmsPage, DiskSample, ProxyNode, Setting, UsageEvent
 from .scraping import Category, MediaFile, Scrape, ScrapeItem
 from .user import User
 
@@ -32,4 +32,5 @@ __all__ = [
     "Setting",
     "CmsPage",
     "DiskSample",
+    "ProxyNode",
 ]

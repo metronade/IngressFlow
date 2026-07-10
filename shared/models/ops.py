@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -61,3 +61,23 @@ class DiskSample(Base):
     bytes_in_rate: Mapped[float] = mapped_column(Float)
     bytes_out_rate: Mapped[float] = mapped_column(Float)
     hours_to_full: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
+class ProxyNode(Base, TimestampMixin):
+    """Residential proxy mesh node — a self-registering agent (§4.8a). Durable
+    admin config only: token_hash never stores the plaintext (same one-time-
+    reveal pattern as PlatformCredential.secret_blob), priority/enabled are
+    admin-managed here. Live connection state (currently connected, recent
+    failure streak, bytes relayed) stays in the gateway process's memory —
+    it's the one thing actually holding the WebSocket connections — and is
+    surfaced to the admin UI via the gateway's own status endpoint, not this
+    table."""
+
+    __tablename__ = "proxy_nodes"
+
+    id: Mapped[uuid.UUID] = mapped_column(PGUUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(String(100), unique=True)
+    token_hash: Mapped[str] = mapped_column(String(128))
+    priority: Mapped[int] = mapped_column(Integer, default=100)  # lower tried first
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
