@@ -1,0 +1,22 @@
+# Residential proxy agent (PLAN.md §4.8a) — runs on the RESIDENTIAL/home
+# side (e.g. an Unraid box), NOT alongside the main stack. Copy this repo's
+# `proxy/` directory over (or clone the whole repo) and run:
+#
+#   cp .env.agent.example .env.agent   # fill in GATEWAY_URL + AGENT_TOKEN
+#   docker compose -f docker-compose.agent.yml up -d --build
+#
+# GATEWAY_URL is the RZ's public WebSocket endpoint (wss://<domain>/agent/
+# connect once NPM fronts it — see docs/PROXY.md). AGENT_TOKEN is generated
+# once when the admin adds this node in /admin/proxy-nodes and shown only
+# at that moment.
+#
+# No ports are published here on purpose — this container only ever makes
+# an outbound connection, so it needs zero inbound firewall/router
+# configuration on this network.
+services:
+  agent:
+    build:
+      context: ./proxy
+      dockerfile: Dockerfile.agent
+    env_file: .env.agent
+    restart: unless-stopped
