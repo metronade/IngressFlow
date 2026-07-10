@@ -71,3 +71,32 @@ class SystemStatsOut(BaseModel):
     disk_total: int
     disk_used: int
     disk_free: int
+
+
+class ProxyNodeOut(BaseModel):
+    id: UUID
+    name: str
+    priority: int
+    enabled: bool
+    last_seen_at: datetime | None
+    created_at: datetime
+    # live, from the gateway's own /stats — None if the gateway couldn't be reached
+    connected: bool | None = None
+    demoted: bool | None = None
+    consecutive_failures: int | None = None
+    bytes_relayed: int | None = None
+
+
+class ProxyNodeCreate(BaseModel):
+    name: str
+    priority: int = 100
+
+
+class ProxyNodeUpdate(BaseModel):
+    priority: int | None = None
+    enabled: bool | None = None
+
+
+class ProxyNodeCreated(BaseModel):
+    node: ProxyNodeOut
+    token: str  # shown once — never retrievable again

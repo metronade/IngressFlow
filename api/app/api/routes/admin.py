@@ -7,6 +7,8 @@ PlatformCredential is the one thing standing between Tier-1 APIs being
 "built but inactive" and actually routing there (PLAN.md §4.3/§12).
 """
 
+import hashlib
+import secrets
 import shutil
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
@@ -27,13 +29,17 @@ from app.schemas.admin import (
     CredentialUpdate,
     DiskSampleOut,
     PlatformHealthOut,
+    ProxyNodeCreate,
+    ProxyNodeCreated,
+    ProxyNodeOut,
+    ProxyNodeUpdate,
     SettingOut,
     SettingUpsert,
     SystemStatsOut,
 )
 from app.services.settings import delete_setting, list_settings, set_setting
 from shared.crypto import encrypt_secret
-from shared.models import AuditLog, DiskSample, MediaFile, PlatformCredential, ScrapeItem, User
+from shared.models import AuditLog, DiskSample, MediaFile, PlatformCredential, ProxyNode, ScrapeItem, User
 from shared.models.enums import CredentialKind
 from shared.storage import MEDIA_ROOT
 
@@ -269,3 +275,120 @@ async def get_proxy_stats() -> dict:
             return resp.json()
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"Could not reach the proxy gateway: {exc}") from exc
+
+
+# -- residential proxy mesh (§4.8a) -------------------------------------------
+
+
+async def _push_node_sync(db: AsyncSession) -> None:
+    """Pushes the full current node allowlist to the gateway. Called after
+    every create/update/delete so an admin change (disable a node, drop its
+    priority) takes effect immediately — the gateway holds no DB connection
+    of its own (§4.8a), this is its only way to learn about changes."""
+    result = await db.execute(select(ProxyNode))
+    nodes = [
+        {
+            "id": str(n.id),
+            "name": n.name,
+            "token_hash": n.token_hash,
+            "priority": n.priority,
+            "enabled": n.enabled,
+        }
+        for n in result.scalars().all()
+    ]
+    settings = get_settings()
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post(
+                settings.proxy_internal_url,
+                json={"nodes": nodes},
+                headers={"x-internal-secret": settings.proxy_internal_secret},
+            )
+    except httpx.HTTPError:
+        # The gateway degrades gracefully with a stale/empty allowlist
+        # (direct passthrough) — surfacing this as a hard 502 would block
+        # otherwise-fine admin operations just because the gateway is
+        # briefly unreachable (e.g. mid-restart).
+        pass
+
+
+async def _live_node_status() -> dict[str, dict]:
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(get_settings().proxy_stats_url)
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.HTTPError:
+        return {}
+    return {e["node_id"]: e for e in data.get("exits", []) if e.get("kind") == "agent" and e.get("node_id")}
+
+
+def _node_out(n: ProxyNode, live: dict) -> ProxyNodeOut:
+    status = live.get(str(n.id))
+    # The gateway tracks last-seen live (heartbeats), not this DB column —
+    # nothing else writes to ProxyNode.last_seen_at, so prefer the live
+    # value whenever the gateway is reachable and has ever seen this node.
+    last_seen_at = n.last_seen_at
+    if status and status.get("last_seen_at"):
+        last_seen_at = datetime.fromtimestamp(status["last_seen_at"], tz=timezone.utc)
+    return ProxyNodeOut(
+        id=n.id,
+        name=n.name,
+        priority=n.priority,
+        enabled=n.enabled,
+        last_seen_at=last_seen_at,
+        created_at=n.created_at,
+        connected=status is not None,
+        demoted=status.get("demoted") if status else None,
+        consecutive_failures=status.get("consecutive_failures") if status else None,
+        bytes_relayed=status.get("bytes_relayed") if status else None,
+    )
+
+
+@router.get("/proxy-nodes", response_model=list[ProxyNodeOut])
+async def list_proxy_nodes(db: AsyncSession = Depends(get_db)) -> list[ProxyNodeOut]:
+    result = await db.execute(select(ProxyNode).order_by(ProxyNode.priority, ProxyNode.name))
+    live = await _live_node_status()
+    return [_node_out(n, live) for n in result.scalars().all()]
+
+
+@router.post("/proxy-nodes", response_model=ProxyNodeCreated, status_code=201)
+async def create_proxy_node(payload: ProxyNodeCreate, db: AsyncSession = Depends(get_db)) -> ProxyNodeCreated:
+    token = secrets.token_urlsafe(32)
+    node = ProxyNode(
+        name=payload.name,
+        token_hash=hashlib.sha256(token.encode()).hexdigest(),
+        priority=payload.priority,
+        enabled=True,
+    )
+    db.add(node)
+    await db.commit()
+    await _push_node_sync(db)
+    return ProxyNodeCreated(node=_node_out(node, {}), token=token)
+
+
+@router.patch("/proxy-nodes/{node_id}", response_model=ProxyNodeOut)
+async def update_proxy_node(
+    node_id: UUID, payload: ProxyNodeUpdate, db: AsyncSession = Depends(get_db)
+) -> ProxyNodeOut:
+    node = await db.get(ProxyNode, node_id)
+    if node is None:
+        raise HTTPException(status_code=404, detail="Node not found")
+    if payload.priority is not None:
+        node.priority = payload.priority
+    if payload.enabled is not None:
+        node.enabled = payload.enabled
+    await db.commit()
+    await _push_node_sync(db)
+    live = await _live_node_status()
+    return _node_out(node, live)
+
+
+@router.delete("/proxy-nodes/{node_id}", status_code=204)
+async def delete_proxy_node(node_id: UUID, db: AsyncSession = Depends(get_db)) -> None:
+    node = await db.get(ProxyNode, node_id)
+    if node is None:
+        raise HTTPException(status_code=404, detail="Node not found")
+    await db.delete(node)
+    await db.commit()
+    await _push_node_sync(db)

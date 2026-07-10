@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     admin_bootstrap_email: str | None = None  # one-time: this email becomes admin on registration
     media_root: str = "/data/scrapes"  # for admin disk-usage reporting (shared.storage.MEDIA_ROOT)
     proxy_stats_url: str = "http://proxy:8888/stats"
+    proxy_internal_url: str = "http://proxy:8888/internal/nodes/sync"
+    proxy_internal_secret: str = ""  # shared secret with the proxy service (§4.8a)
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
