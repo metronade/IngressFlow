@@ -14,9 +14,12 @@ Group 2
 https://example.com/c`;
 
 // Platforms the parser/extractor cascade recognizes by name (resolver.py's
-// _PLATFORM_DOMAINS) — the ones a Tier-1 API key can ever be enabled for.
-// Anything else is still attempted via the generic yt-dlp/gallery-dl/
-// Playwright cascade, just without a named-platform guarantee.
+// _PLATFORM_DOMAINS). Most of these are also Tier-1 API candidates later;
+// Al Jazeera is scrape-only by nature (no public retrieval API) but still
+// gets a dedicated, reliable extractor (worker/scraping/extractors/
+// aljazeera.py). Anything else is still attempted via the generic
+// yt-dlp/gallery-dl/Playwright cascade, just without a named-platform
+// guarantee.
 const SUPPORTED_PLATFORMS = [
   "YouTube",
   "TikTok",
@@ -26,6 +29,7 @@ const SUPPORTED_PLATFORMS = [
   "Reddit",
   "Snapchat",
   "Vimeo",
+  "Al Jazeera",
 ];
 
 function countLinks(text: string): number {

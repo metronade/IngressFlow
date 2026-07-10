@@ -207,6 +207,8 @@ Each extractor records **which tier/method served the item** (`MediaFile.source_
 
 Config toggles (`video_only`, `image_only`, `include_metadata`) filter what each tier keeps. Metadata JSON is written alongside media when enabled.
 
+**Al Jazeera** added as a named platform post-launch (scrape-only — no public retrieval API, so it's Tier-2 by nature, not a Tier-1 candidate). yt-dlp's own `AlJazeeraIE` doesn't cover the `/video/<program>/<date>/<slug>` URL shape Al Jazeera actually uses for program episodes (its regex only matches `/videos/`, `/programs/<name>/`, `/features/`, `/news/`), which fell through to Playwright's generic DOM scrape — images only, no video. Turned out the video's Brightcove embed URL is already present in the page's own server-rendered JSON-LD (`VideoObject.embedUrl`) — no browser/click interaction needed at all. `worker/scraping/extractors/aljazeera.py` runs first in the cascade (cheap no-op domain check for every other platform), fetches the page, pulls that embed URL out, and hands it to the existing yt-dlp wrapper — which already extracts Brightcove correctly on its own; `source_method` still records `ytdlp`. Falls through to gallery-dl/Playwright as before if a page has no video embed.
+
 ### 4.4 Realtime pipeline (WebSockets)
 
 Workers **must not** hold WebSocket connections. Flow:

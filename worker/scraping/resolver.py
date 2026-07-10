@@ -24,6 +24,8 @@ _PLATFORM_DOMAINS = {
     "facebook.com": "facebook",
     "fb.watch": "facebook",
     "vimeo.com": "vimeo",
+    "aljazeera.com": "aljazeera",
+    "aljazeera.net": "aljazeera",  # regional subsites: balkans./chinese./mubasher.aljazeera.net
 }
 
 
