@@ -8,9 +8,11 @@ import {
   exportUrl,
   getCategories,
   getMedia,
+  getShareStatus,
   type MediaFile,
   mediaFileUrl,
 } from "@/lib/api";
+import { ExpiryBanner } from "@/components/ExpiryBanner";
 
 function triggerDownload(blob: Blob, filename: string) {
   const url = URL.createObjectURL(blob);
@@ -33,10 +35,14 @@ function GalleryContent() {
   const [loading, setLoading] = useState(true);
   const [preview, setPreview] = useState<MediaFile | null>(null);
   const [exporting, setExporting] = useState(false);
+  const [expiresAt, setExpiresAt] = useState<string | null>(null);
 
   useEffect(() => {
     getCategories(token)
       .then(setCategories)
+      .catch(() => {});
+    getShareStatus(token)
+      .then((s) => setExpiresAt(s.expires_at))
       .catch(() => {});
   }, [token]);
 
@@ -71,6 +77,8 @@ function GalleryContent() {
   return (
     <main className="mx-auto flex min-h-screen max-w-6xl flex-col gap-6 p-8">
       <h1 className="text-2xl font-semibold">Gallery</h1>
+
+      {expiresAt && <ExpiryBanner expiresAt={expiresAt} />}
 
       <div className="flex flex-wrap items-center gap-3">
         <select

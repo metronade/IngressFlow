@@ -97,7 +97,8 @@ export default function Home() {
         <h1 className="text-2xl font-semibold">IngressFlow</h1>
         <p className="mt-1 text-neutral-400">
           Paste a category header followed by its links. A blank line or a new header starts the
-          next category.
+          next category. Headers are optional — links with no header above them are grouped under
+          &quot;uncategorized&quot;.
         </p>
         <div className="mt-2 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-xs text-neutral-500">
           <span className="text-neutral-600">Officially supported:</span>

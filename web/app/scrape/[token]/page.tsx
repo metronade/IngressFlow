@@ -5,6 +5,7 @@ import { useParams } from "next/navigation";
 import Link from "next/link";
 import { cancelScrape, getShareStatus, type ShareStatus } from "@/lib/api";
 import { copyToClipboard } from "@/lib/clipboard";
+import { ExpiryBanner } from "@/components/ExpiryBanner";
 import { useShareSocket } from "@/lib/ws";
 
 function statusColor(status: string): string {
@@ -139,6 +140,8 @@ export default function ScrapeDashboard() {
   return (
     <main className="mx-auto flex min-h-screen max-w-3xl flex-col gap-6 p-8">
       <h1 className="text-2xl font-semibold">Scrape progress</h1>
+
+      {status && <ExpiryBanner expiresAt={status.expires_at} />}
 
       <div className="grid grid-cols-2 gap-4 rounded-lg border border-neutral-800 bg-neutral-900 p-4 sm:grid-cols-4">
         <Stat label="Links" value={`${linksDone} / ${linksTotal}`} />
