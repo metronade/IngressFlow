@@ -156,6 +156,8 @@ Crash resilience (the trade-off we pay for): a chain gets free per-link retry gr
 - The batch task is **idempotent + resumable**: on retry it skips items already in a terminal state, so a crashed batch resumes from the last checkpoint rather than restarting.
 - `acks_late=True` + `task_reject_on_worker_lost=True` so an in-flight batch is redelivered if its worker dies.
 
+**Bug fixed post-launch:** "checkpointed to Postgres immediately" originally meant one `session_scope()` (one transaction) spanning an *entire* item — SCRAPING through the terminal status. That commits only once, at the very end, so a different DB connection (the API, the dashboard) could never actually observe SCRAPING — it'd see PENDING right up until the item was already done. `worker/tasks/batch.py`'s `_process_one` now uses three short transactions per item (mark SCRAPING + commit; extract with no open transaction; persist results + terminal status + commit), publishing a WS snapshot after each commit. Confirmed via direct DB polling at 200ms resolution — SCRAPING is now genuinely visible for the item's full processing time, which is what lets the dashboard's per-item list show a real "currently scraping" indicator instead of skipping straight from pending to done.
+
 Sketch:
 
 ```python

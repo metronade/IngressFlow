@@ -79,6 +79,12 @@ def _enabled_api_platforms(db) -> set[str]:
     return {r[0] for r in rows}
 
 
+def _publish_snapshot(scrape_id: str) -> None:
+    with session_scope() as db:
+        scrape = db.get(Scrape, scrape_id)
+        _publish(scrape_id, _snapshot(db, scrape))
+
+
 def _process_one(
     scrape_id: str,
     item_id: str,
@@ -88,7 +94,16 @@ def _process_one(
 ) -> str:
     """Processes one link end to end, checkpointing to Postgres immediately
     (PLAN.md §4.2's crash-resilience requirement). Returns "processed",
-    "skipped" (already terminal — a resumed run), or "cancelled"."""
+    "skipped" (already terminal — a resumed run), or "cancelled".
+
+    Split into separate short-lived transactions rather than one spanning
+    the whole item: the SCRAPING transition has to actually commit — and
+    become visible to a *different* DB connection (the API, the dashboard)
+    — before the (potentially slow) extraction runs. A single transaction
+    for the whole item means SCRAPING and the terminal status both land in
+    the same commit, so nobody ever observes "scraping" at all — which is
+    exactly what was happening before this split.
+    """
     with session_scope() as db:
         item = db.get(ScrapeItem, item_id)
         if item.status not in (ScrapeItemStatus.PENDING, ScrapeItemStatus.SCRAPING):
@@ -98,40 +113,49 @@ def _process_one(
 
         scrape = db.get(Scrape, scrape_id)
         config = scrape.config or {}
+        url = item.url
+        category_id = item.category_id
+        category_name = item.category.name
 
+        route_result = route(url, enabled_api_platforms)
+        item.platform = route_result.platform
         item.status = ScrapeItemStatus.SCRAPING
         item.started_at = datetime.now(timezone.utc)
-        db.flush()
 
-        route_result = route(item.url, enabled_api_platforms)
-        item.platform = route_result.platform
+    _publish_snapshot(scrape_id)
 
-        try:
-            if route_result.tier == "api":
-                # Unreachable in v1 (enabled_api_platforms is always empty
-                # until an admin enables a credential) — see api_stub.py.
-                result = api_stub.extract(item.url, platform=route_result.platform, config=config)
-            else:
+    try:
+        if route_result.tier == "api":
+            # Unreachable in v1 (enabled_api_platforms is always empty
+            # until an admin enables a credential) — see api_stub.py.
+            result = api_stub.extract(url, platform=route_result.platform, config=config)
+        else:
+            with session_scope() as db:
                 cookie_file = scraping_session.cookie_file_for(db, route_result.platform)
-                try:
-                    result = run_tier2(
-                        item.url,
-                        user_agent=batch_session.user_agent,
-                        proxy_url=batch_session.proxy_url,
-                        cookie_file=cookie_file,
-                        work_dir=work_dir,
-                        config=config,
-                    )
-                finally:
-                    if cookie_file:
-                        os.remove(cookie_file)
-        except Exception as exc:  # noqa: BLE001 — a per-item failure, the batch continues
+            try:
+                result = run_tier2(
+                    url,
+                    user_agent=batch_session.user_agent,
+                    proxy_url=batch_session.proxy_url,
+                    cookie_file=cookie_file,
+                    work_dir=work_dir,
+                    config=config,
+                )
+            finally:
+                if cookie_file:
+                    os.remove(cookie_file)
+    except Exception as exc:  # noqa: BLE001 — a per-item failure, the batch continues
+        with session_scope() as db:
+            item = db.get(ScrapeItem, item_id)
             item.status = ScrapeItemStatus.FAILED
             item.error = str(exc)[:2000]
             item.finished_at = datetime.now(timezone.utc)
-            db.flush()
-            _publish(scrape_id, _snapshot(db, scrape))
-            return "processed"
+        _publish_snapshot(scrape_id)
+        return "processed"
+
+    with session_scope() as db:
+        item = db.get(ScrapeItem, item_id)
+        scrape = db.get(Scrape, scrape_id)
 
         images_found = sum(1 for m in result.media if m.type == "image")
         videos_found = sum(1 for m in result.media if m.type == "video")
@@ -148,11 +172,11 @@ def _process_one(
                     db,
                     scrape_id=scrape_id,
                     item_id=item.id,
-                    category_id=item.category_id,
-                    category_name=item.category.name,
+                    category_id=category_id,
+                    category_name=category_name,
                     extracted=media,
                     source_method=result.source_method,
-                    source_url=item.url,
+                    source_url=url,
                     include_metadata=bool(config.get("include_metadata")),
                 )
             except OSError:
@@ -181,9 +205,8 @@ def _process_one(
         scrape.total_images += images_ok
         scrape.total_videos += videos_ok
 
-        db.flush()
-        _publish(scrape_id, _snapshot(db, scrape))
-        return "processed"
+    _publish_snapshot(scrape_id)
+    return "processed"
 
 
 @celery_app.task(name="tasks.batch.run_batch", bind=True, acks_late=True, task_reject_on_worker_lost=True)

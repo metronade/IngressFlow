@@ -16,11 +16,25 @@ function statusColor(status: string): string {
       return "bg-yellow-500";
     case "failed":
       return "bg-red-500";
-    case "scraping":
-      return "bg-blue-500 animate-pulse";
     default:
       return "bg-neutral-600";
   }
+}
+
+// The item currently being scraped gets its own blinking yellow dot rather
+// than a plain color swap — a smooth opacity fade (animate-pulse) read as
+// too subtle to notice at a glance; the ping ring is the same "still
+// active" language already used for the queued/running StatusBadge.
+function ItemStatusDot({ status }: { status: string }) {
+  if (status === "scraping") {
+    return (
+      <span className="relative flex h-3 w-3 shrink-0" title="scraping">
+        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-yellow-400 opacity-75" />
+        <span className="relative inline-flex h-3 w-3 rounded-full bg-yellow-400" />
+      </span>
+    );
+  }
+  return <span className={`h-3 w-3 shrink-0 rounded-full ${statusColor(status)}`} title={status} />;
 }
 
 function formatBytes(bytes: number): string {
@@ -180,7 +194,7 @@ export default function ScrapeDashboard() {
             key={item.id}
             className="flex items-center gap-3 rounded-lg border border-neutral-800 bg-neutral-900 p-3 text-sm"
           >
-            <span className={`h-3 w-3 shrink-0 rounded-full ${statusColor(item.status)}`} title={item.status} />
+            <ItemStatusDot status={item.status} />
             <span className="flex-1 truncate" title={item.url}>
               {item.url}
             </span>
